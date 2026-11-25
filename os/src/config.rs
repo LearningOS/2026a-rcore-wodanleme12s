@@ -23,3 +23,15 @@ pub const TRAP_CONTEXT_BASE: usize = TRAMPOLINE - PAGE_SIZE;
 pub const CLOCK_FREQ: usize = 12500000;
 /// the physical memory end
 pub const MEMORY_END: usize = 0x88000000;
+/// the physical base address of RAM (and of the kernel image)
+pub const BASE_ADDRESS: usize = 0x8020_0000;
+/// Highest virtual address a fixed `mmap` may reach (exclusive).
+///
+/// The application image is position-independent and lives very low, while the
+/// shared trampoline and trap-frame pages sit at the top of the SV39 space, so
+/// everything in between is fair game. The real boundary is where SV39's 39-bit
+/// non-sign-extended window ends (`0x40_0000_0000`): above that a virtual page
+/// number would need more than three levels of indexes and would alias onto the
+/// sign-extended kernel half. A generous ceiling keeps the policy "only what is
+/// actually owned blocks you", instead of a guessed floor or mid-range cap.
+pub const USER_MMAP_LIMIT: usize = 0x4000_0000_00;

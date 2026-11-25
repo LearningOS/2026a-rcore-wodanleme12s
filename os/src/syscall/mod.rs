@@ -30,6 +30,7 @@ mod process;
 
 use fs::*;
 use process::*;
+use crate::task::record_syscall;
 
 /// handle syscall exception with `syscall_id` and other arguments
 pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
@@ -44,4 +45,15 @@ pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
         SYSCALL_SBRK => sys_sbrk(args[0] as i32),
         _ => panic!("Unsupported syscall_id: {}", syscall_id),
     }
+}
+
+/// Dispatch one environment call.
+///
+/// The counter for the *current* task is bumped before dispatch, which is what
+/// makes `sys_trace(Syscall, SYSCALL_TRACE, _)` count the call that answers it
+/// (see the ch3_trace contract). An unsupported number panics while counting,
+/// so accounting must not swallow it.
+pub fn syscall_dispatch(syscall_id: usize, args: [usize; 3]) -> isize {
+    record_syscall(syscall_id);
+    syscall(syscall_id, args)
 }

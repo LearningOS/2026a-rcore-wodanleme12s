@@ -9,12 +9,14 @@
 //! Be careful when you see `__switch` ASM function in `switch.S`. Control flow around this function
 //! might not be what you expect.
 
+mod accounting;
 mod context;
 mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::MemorySet;
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -22,6 +24,7 @@ use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
 
+pub use accounting::SyscallAccounting;
 pub use context::TaskContext;
 
 /// The task manager, where all the tasks are managed.
@@ -126,6 +129,30 @@ impl TaskManager {
         inner.tasks[inner.current_task].get_trap_cx()
     }
 
+    /// Run `f` with a borrow of the current task's address space.
+    ///
+    /// The closure form is deliberate: the address space lives behind the
+    /// `UPSafeCell` guard, so returning a reference would let a caller keep it
+    /// across a task switch and then read another task's page table.
+    fn with_current_memory_set<T>(&self, f: impl FnOnce(&mut MemorySet) -> T) -> T {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        f(&mut inner.tasks[cur].memory_set)
+    }
+
+    /// Run `f` with an immutable borrow of the current task's address space.
+    fn with_current_memory_set_ref<T>(&self, f: impl FnOnce(&MemorySet) -> T) -> T {
+        let inner = self.inner.exclusive_access();
+        f(&inner.tasks[inner.current_task].memory_set)
+    }
+
+    /// Run `f` with a mutable borrow of the current task's syscall counters.
+    fn with_current_accounting<T>(&self, f: impl FnOnce(&mut SyscallAccounting) -> T) -> T {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        f(&mut inner.tasks[cur].syscall_accounting)
+    }
+
     /// Change the current 'Running' task's program break
     pub fn change_current_program_brk(&self, size: i32) -> Option<usize> {
         let mut inner = self.inner.exclusive_access();
@@ -196,6 +223,29 @@ pub fn current_user_token() -> usize {
 /// Get the current 'Running' task's trap contexts.
 pub fn current_trap_cx() -> &'static mut TrapContext {
     TASK_MANAGER.get_current_trap_cx()
+}
+
+/// Run `f` against the current task's address space (page table + VMA table),
+/// with write access for mmap/munmap.
+pub fn with_current_memory_set<T>(f: impl FnOnce(&mut MemorySet) -> T) -> T {
+    TASK_MANAGER.with_current_memory_set(f)
+}
+
+/// Run `f` against the current task's address space, read-only. This is the
+/// handle the user pointer gate translates through.
+pub fn current_user_memory_set_ref<T>(f: impl FnOnce(&MemorySet) -> T) -> T {
+    TASK_MANAGER.with_current_memory_set_ref(f)
+}
+
+/// Count one syscall for the current task, before dispatch.
+pub fn record_syscall(syscall_id: usize) {
+    TASK_MANAGER.with_current_accounting(|acc| acc.record(syscall_id));
+}
+
+/// Read the current task's counter for `syscall_id`, or `None` if the number is
+/// outside the accounting table.
+pub fn syscall_count(syscall_id: usize) -> Option<usize> {
+    TASK_MANAGER.with_current_accounting(|acc| acc.count(syscall_id))
 }
 
 /// Change the current 'Running' task's program break

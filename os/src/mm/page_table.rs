@@ -66,6 +66,10 @@ impl PageTableEntry {
     pub fn writable(&self) -> bool {
         (self.flags() & PTEFlags::W) != PTEFlags::empty()
     }
+    /// The page may be reached from U mode (its U bit is set)?
+    pub fn user_accessible(&self) -> bool {
+        (self.flags() & PTEFlags::U) != PTEFlags::empty()
+    }
     /// The page pointered by page table entry is executable?
     pub fn executable(&self) -> bool {
         (self.flags() & PTEFlags::X) != PTEFlags::empty()
@@ -116,7 +120,7 @@ impl PageTable {
         result
     }
     /// Find PageTableEntry by VirtPageNum
-    fn find_pte(&self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
+    fn find_pte(&mut self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
         let idxs = vpn.indexes();
         let mut ppn = self.root_ppn;
         let mut result: Option<&mut PageTableEntry> = None;
@@ -133,6 +137,22 @@ impl PageTable {
         }
         result
     }
+    /// Read-only walk: locate the leaf entry of `vpn` without allocating anything.
+    fn find_pte_ref(&self, vpn: VirtPageNum) -> Option<&PageTableEntry> {
+        let idxs = vpn.indexes();
+        let mut ppn = self.root_ppn;
+        for i in 0..3 {
+            let pte = &ppn.get_pte_array()[idxs[i]];
+            if i == 2 {
+                return Some(pte);
+            }
+            if !pte.is_valid() {
+                return None;
+            }
+            ppn = pte.ppn();
+        }
+        None
+    }
     /// set the map between virtual page number and physical page number
     #[allow(unused)]
     pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
@@ -143,13 +163,23 @@ impl PageTable {
     /// remove the map between virtual page number and physical page number
     #[allow(unused)]
     pub fn unmap(&mut self, vpn: VirtPageNum) {
-        let pte = self.find_pte(vpn).unwrap();
-        assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
+        let pte = self
+            .find_pte(vpn)
+            .unwrap_or_else(|| panic!("unmap({:?}) on a hole", vpn));
         *pte = PageTableEntry::empty();
     }
     /// get the page table entry from the virtual page number
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
-        self.find_pte(vpn).map(|pte| *pte)
+        self.find_pte_ref(vpn).map(|pte| *pte)
+    }
+    /// Like [`PageTable::map`], but tolerates a leaf that already exists as long
+    /// as it is invalid. A fixed `mmap` may land in an address range whose
+    /// second- or third-level page table was built earlier and then emptied by
+    /// `munmap`; only a *valid* leaf is a real conflict.
+    pub fn map_or_replace_invalid(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
+        let pte = self.find_pte_create(vpn).unwrap();
+        assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
+        *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
     }
     /// get the token from the page table
     pub fn token(&self) -> usize {
