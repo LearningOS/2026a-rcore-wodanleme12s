@@ -61,6 +61,19 @@ impl Semaphore {
             .collect()
     }
 
+    /// Remove a specific waiter from the queue, by identity rather than position:
+    /// a refused victim can sit anywhere in a FIFO queue.
+    pub(crate) fn remove_waiter(&self, task: &Arc<TaskControlBlock>) {
+        let mut inner = self.inner.exclusive_access();
+        if let Some(pos) = inner
+            .wait_queue
+            .iter()
+            .position(|t| Arc::ptr_eq(t, task))
+        {
+            inner.wait_queue.remove(pos);
+        }
+    }
+
     /// up operation of semaphore
     ///
     /// A released unit either goes straight to the head of the wait queue (when
@@ -114,21 +127,40 @@ impl Semaphore {
         }
         // count <= 0: this down has to park somebody, so ask the detector first,
         // before the count or the queue are touched.
-        if deadlock::check(key) {
-            return DEADLOCK;
-        }
-        let task = current_task().unwrap();
-        deadlock::park_me(key);
-        {
+        let me = current_task().unwrap();
+        let victim = match deadlock::check(key) {
+            Some(v) => v,
+            None => {
+                deadlock::park_me(key);
+                {
+                    let mut inner = self.inner.exclusive_access();
+                    inner.count -= 1;
+                    inner.wait_queue.push_back(me);
+                    drop(inner);
+                    block_current_and_run_next();
+                }
+                // Resumed with a unit: `up` moved us out of the queue and recorded
+                // the grant for us, so only the parked marker is left to clear.
+                deadlock::clear_parked_me(key);
+                return 0;
+            }
+        };
+        // Somebody on the ring must be refused. When that is another task it is
+        // already queued, so `refuse_queued` pulls it out and wakes it; we then park
+        // as usual, because the edge the graph keeps is ours. When the victim *is*
+        // the caller there is nobody to pull out and joining the queue would be
+        // wrong — the object's counter only owes a unit to its queued waiters, so we
+        // return without touching either.
+        if deadlock::refuse_if_not_me(victim, key) {
+            deadlock::park_me(key);
             let mut inner = self.inner.exclusive_access();
             inner.count -= 1;
-            inner.wait_queue.push_back(task);
+            inner.wait_queue.push_back(me);
             drop(inner);
             block_current_and_run_next();
+            deadlock::clear_parked_me(key);
+            return 0;
         }
-        // Resumed with a unit: `up` moved us out of the queue and recorded the
-        // grant for us, so only the parked marker is left to clear.
-        deadlock::clear_parked_me(key);
-        0
+        DEADLOCK
     }
 }

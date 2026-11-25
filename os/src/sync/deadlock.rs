@@ -1,12 +1,12 @@
 //! Deadlock detection: a bipartite wait-for graph rebuilt from scratch on demand.
 //!
 //! This module keeps **no edges of its own**. Every time an acquire would have to
-//! park its caller, [`would_deadlock`] walks the objects that already exist and
-//! derives the whole graph from them, then answers one question: starting from the
-//! object being asked for, can we get back to the asking task? Because the graph is
-//! rebuilt rather than incrementally maintained, there is nothing to invalidate when
-//! a grant is handed over, a queue is served, or a thread dies mid-hold — the three
-//! places where an incrementally kept graph goes stale and starts inventing cycles.
+//! park its caller, [`check`] walks the objects that already exist and derives the
+//! whole graph from them, then answers one question: starting from the object being
+//! asked for, can we get back to the asking task? Because the graph is rebuilt
+//! rather than incrementally maintained, there is nothing to invalidate when a grant
+//! is handed over, a queue is served, or a thread dies mid-hold — the three places
+//! where an incrementally kept graph goes stale and starts inventing cycles.
 //!
 //! # Where each kind of edge comes from
 //!
@@ -31,16 +31,19 @@
 //! cycle. Reading the remaining capacity first is what turns sem2 from a false
 //! positive into a no-op.
 //!
-//! # Victim selection
+//! # Who gets refused (`ch8_deadlock_sem1`)
 //!
-//! Detection alone is not enough for the sem1 test: three threads grab resources,
-//! keep *running*, and only then ask for the next one, so whoever asks last is not
-//! necessarily the right one to refuse. When a cycle is found we therefore pick the
-//! cycle member whose pending acquire has not been granted yet and which holds
-//! nothing else worth punishing, smallest `(pid, tid)` first, and hand *that* task
-//! the error code through its own syscall ([`take_abort_for`]). If no such task
-//! exists besides the caller, the caller itself is refused. Either way exactly one
-//! edge disappears and nothing sleeps until the 30s QEMU timeout cuts the run off.
+//! Detection alone is not enough. In sem1 the three threads allocate, keep *running*
+//! after each syscall, and only later ask for the next resource, so the request that
+//! closes the ring arrives while its author is still holding something else and will
+//! go on to release it. Refusing *that* task buys nothing: the ring stays shut behind
+//! it and everybody sleeps until the 30s QEMU budget is spent. The rule implemented
+//! by [`pick_victim`] is therefore the textbook "abort the transaction that does not
+//! release anything else", expressed on this derived graph as: among the cycle
+//! members, prefer one whose pending request is queued **behind at least one other
+//! waiter** on the same object — aborting it leaves the front waiter satisfiable, so
+//! the ring really opens. Only when every member is at the head of its queue (the
+//! self-recursion case of mutex1) is the caller itself refused.
 //!
 //! Condvars contribute no edge: they park a task until somebody signals, not until a
 //! resource is granted, so `test_condvar`, `mpsc_sem` and `sync_sem` are untouched.
@@ -94,22 +97,26 @@ struct Graph {
     blocked_on: Vec<(TaskKey, ResKey)>,
     /// For each task: how many units it holds per resource.
     held: Vec<(TaskKey, Vec<(ResKey, usize)>)>,
-    /// Tasks that hold something but are not parked: they are running and will
-    /// release eventually, so they terminate a chain rather than extend one.
-    idle_holders: Vec<TaskKey>,
 }
 
-/// An abort queued by victim selection, consumed by the victim's own syscall.
-struct Pending {
+/// A refusal waiting for the punished thread to resume in its own syscall.
+///
+/// `ahead` records how many waiters stood *in front of* the victim when it was
+/// pulled out of the queue. That number is what tells a re-asking victim whether its
+/// denial actually opened the ring: with somebody ahead, that head waiter can now be
+/// served by the unit we just freed, so the cycle is broken and asking again must not
+/// refuse anyone further. From an empty queue, refusing again is the only progress.
+struct Abort {
     task: TaskKey,
-    res: ResKey,
+    key: ResKey,
     code: isize,
+    ahead: usize,
 }
 
 lazy_static! {
-    /// Refusals waiting for the punished thread to resume. Small and short-lived:
-    /// an entry is dropped as soon as that task re-enters the syscall.
-    static ref PENDING: super::UPSafeCell<Vec<Pending>> =
+    /// Refusals queued by victim selection. Small and short-lived: an entry is
+    /// dropped as soon as that task re-enters the syscall it was parked in.
+    static ref ABORTED: super::UPSafeCell<Vec<Abort>> =
         unsafe { super::UPSafeCell::new(Vec::new()) };
 }
 
@@ -117,12 +124,35 @@ lazy_static! {
 // graph construction
 // ---------------------------------------------------------------------------
 
-/// The `(pid, tid)` of the current task, used both as the walk's target and as the
-/// key a queued refusal is filed under.
+/// The `(pid, tid)` of a task, used both as the walk's target and as the key a
+/// queued refusal is filed under. `None` for a task that already gave up its user
+/// resources, i.e. one that is exiting or exited.
 fn self_key(task: &Arc<TaskControlBlock>) -> Option<TaskKey> {
     let pid = task.process.upgrade()?.getpid();
     let tid = task.inner_exclusive_access().res.as_ref()?.tid;
     Some((pid, tid))
+}
+
+/// Which semaphore-list slot does this resource key name? `None` for mutex keys.
+fn semaphore_slot(
+    inner: &crate::task::ProcessControlBlockInner,
+    key: ResKey,
+) -> Option<&Option<Arc<Semaphore>>> {
+    if key.1 < SEM_KEY_BASE {
+        return None;
+    }
+    inner.semaphore_list.get(key.1 - SEM_KEY_BASE)
+}
+
+/// Which mutex-list slot does this resource key name? `None` for semaphore keys.
+fn mutex_slot(
+    inner: &crate::task::ProcessControlBlockInner,
+    key: ResKey,
+) -> Option<&Option<Arc<dyn Mutex>>> {
+    if key.1 < MUTEX_KEY_BASE || key.1 >= SEM_KEY_BASE {
+        return None;
+    }
+    inner.mutex_list.get(key.1 - MUTEX_KEY_BASE)
 }
 
 /// Look up a task of this address space by tid.
@@ -142,9 +172,9 @@ fn build_graph(pid: usize) -> Graph {
     let mut g = Graph {
         available: Vec::new(),
         owners: Vec::new(),
+        queue_depth: Vec::new(),
         blocked_on: Vec::new(),
         held: Vec::new(),
-        idle_holders: Vec::new(),
     };
     let process = match pid2process(pid) {
         Some(p) => p,
@@ -155,7 +185,6 @@ fn build_graph(pid: usize) -> Graph {
     // `tasks` is indexed by tid, and a slot is `None` once that thread exited, so
     // a dead holder simply never appears here — that is the whole of our "forget a
     // dying task" logic.
-    let mut live: Vec<TaskKey> = Vec::new();
     let tids: Vec<usize> = {
         let inner = process.inner_exclusive_access();
         (0..inner.tasks.len())
@@ -167,7 +196,6 @@ fn build_graph(pid: usize) -> Graph {
             Some(t) => t,
             None => continue,
         };
-        live.push((pid, tid));
         let key = (pid, tid);
         let (blocked_in, grants) = {
             let tcb = task.inner_exclusive_access();
@@ -204,17 +232,18 @@ fn build_graph(pid: usize) -> Graph {
             Some(b) => b,
             None => continue,
         };
-        let (locked, owner_tid, parked): (bool, Option<usize>, Vec<usize>) = {
+        let (locked, owner_tid, queued): (bool, Option<usize>, usize) = {
             let inner = blocking.inner_ref();
-            (inner.locked, inner.owner_tid(), inner.queued_tids())
+            (inner.locked, inner.owner_tid(), inner.wait_queue.len())
         };
         // Available capacity: 1 unless somebody owns it.
         g.available.push((key, if locked { 0 } else { 1 }));
+        g.queue_depth.push((key, queued));
         // Owners: the holder, unless it is itself parked here (it cannot be, but the
         // subtraction is what makes the rule uniform with semaphores).
         let mut owners: Vec<TaskKey> = Vec::new();
         if let Some(tid) = owner_tid {
-            if !parked.contains(&tid) {
+            if !g.parked_on(key, tid) {
                 owners.push((pid, tid));
             }
         }
@@ -231,19 +260,18 @@ fn build_graph(pid: usize) -> Graph {
             None => continue,
         };
         let key = sem_key(pid, idx);
-        let (count, initial, parked): (isize, isize, Vec<usize>) = {
+        let (count, queued): (isize, usize) = {
             let inner = sem.inner_ref();
-            (inner.count, inner.initial, Semaphore::queued_tids(&inner.wait_queue))
+            (inner.count, inner.wait_queue.len())
         };
         // Free capacity first: with count > 0 nobody is waiting on this object, so
         // it closes no chain. That is the sem2 lesson.
         g.available.push((key, count));
+        g.queue_depth.push((key, queued));
         // Outstanding units are `initial - count`. Which tasks hold them is read
         // off the grant records collected in pass 1, so attribution is exact rather
-        // than guessed; `outstanding` is kept only as a consistency check against
-        // the object's own counter.
+        // than guessed.
         let mut owners: Vec<TaskKey> = Vec::new();
-        let mut attributed = 0usize;
         for (tkey, grants) in g.held.iter() {
             if let Some(n) = grants.iter().find(|(k, _)| *k == key).map(|(_, n)| *n) {
                 if n == 0 {
@@ -251,27 +279,24 @@ fn build_graph(pid: usize) -> Graph {
                 }
                 // A task parked on this very semaphore holds no unit of it: it is
                 // represented by the queue below, not here.
-                if parked.contains(&tkey.1) {
+                if g.parked_on(key, tkey.1) {
                     continue;
                 }
-                attributed += n;
                 owners.push(*tkey);
             }
         }
-        debug_assert_eq!(attributed, (initial - count).max(0) as usize);
         g.owners.push((key, owners));
     }
-
-    // Running holders end chains: they are not waiting for anything, so following
-    // them leads nowhere. We record them so the victim rule can tell "punishable"
-    // from "already satisfied".
-    let blocked: Vec<TaskKey> = g.blocked_on.iter().map(|(t, _)| *t).collect();
-    for (tkey, grants) in g.held.iter() {
-        if !blocked.contains(tkey) && !grants.is_empty() {
-            g.idle_holders.push(*tkey);
-        }
-    }
     g
+}
+
+impl Graph {
+    /// Is the task with this tid currently parked on `res`?
+    fn parked_on(&self, res: ResKey, tid: usize) -> bool {
+        self.blocked_on
+            .iter()
+            .any(|(t, r)| *r == res && t.1 == tid)
+    }
 }
 
 /// Semaphore resource keys are offset so they cannot collide with mutex keys in the
@@ -304,6 +329,13 @@ impl Graph {
     }
     fn available_of(&self, res: ResKey) -> isize {
         self.available
+            .iter()
+            .find(|(k, _)| *k == res)
+            .map(|(_, n)| *n)
+            .unwrap_or(0)
+    }
+    fn queue_depth_of(&self, res: ResKey) -> usize {
+        self.queue_depth
             .iter()
             .find(|(k, _)| *k == res)
             .map(|(_, n)| *n)
@@ -344,67 +376,73 @@ fn reaches(graph: &Graph, start: ResKey, target: TaskKey, seen: &mut Vec<ResKey>
     false
 }
 
-/// All tasks reachable from `start` that sit on a path back to `me`, collected by
-/// re-running the walk restricted to the cycle's resources.
-
 // ---------------------------------------------------------------------------
 // public entry points
 // ---------------------------------------------------------------------------
 
 /// Would parking the current task on `key` close a wait-for cycle?
 ///
-/// `true` means the caller must be refused with `-0xdead`. The caller's own edge is
-/// not in the graph yet (it has not blocked), so "would this close a cycle" is
-/// exactly "does `key` lead back to me?".
-///
-/// Refusing the *last asker* is often the wrong punishment: in sem1 the thread that
-/// completes the ring may be one that merely holds a unit it will put down, while
-/// another member is parked on an acquire that can simply be denied. So we first
-/// look for a cycle member already parked on one of the resources the walk touched —
-/// smallest `(pid, tid)` for reproducibility — and hand the error code to *that* task
-/// through its own syscall. Only when nobody else qualifies do we refuse the caller.
-/// Either way exactly one edge disappears and nothing sleeps until the 30s timeout.
-pub fn check(key: ResKey) -> bool {
+/// The caller's own edge is not in the graph yet (it has not blocked), so "would this
+/// close a cycle" is exactly "does `key` lead back to me?". When it does, somebody on
+/// the ring has to be refused — and it is usually *not* the asker, see [`pick_victim`].
+/// This function therefore returns the chosen victim rather than a yes/no answer:
+/// `Some(me)` means "the primitive must fail this acquire itself", `Some(other)`
+/// means "`refuse_queued` the other one and park normally".
+pub fn check(key: ResKey) -> Option<TaskKey> {
     if !enabled() {
-        return false;
+        return None;
     }
     let me = match current_key() {
         Some(k) => k,
-        None => return false,
+        None => return None,
     };
     let graph = build_graph(me.0);
     let mut seen = Vec::new();
     if !reaches(&graph, key, me, &mut seen) {
-        return false;
+        return None;
     }
-    let mut candidates: Vec<TaskKey> = Vec::new();
+    Some(pick_victim(&graph, &seen, me, key))
+}
+
+/// Choose which cycle member gets the error code.
+///
+/// Candidates are the members already parked mid-acquire on one of the resources the
+/// walk touched, plus the caller (whose pending request is `key`). A denial only
+/// helps if the ring actually opens afterwards, and on a FIFO acquire queue it opens
+/// exactly when the victim was **not** the first waiter: then the head-of-queue task
+/// stays queued for the same unit the victim just gave up, and the holder that feeds
+/// it is still running. So we prefer a candidate whose queue has somebody ahead of it
+/// and break ties by smallest `(pid, tid)` for reproducibility; only when every
+/// candidate would be served next anyway do we refuse the caller.
+fn pick_victim(graph: &Graph, seen: &[ResKey], me: TaskKey, my_key: ResKey) -> TaskKey {
+    // (waiters ahead of the victim, victim). Fewer is better: refusing a task that
+    // stands behind others leaves a satisfiable head of queue, whereas refusing the
+    // head just moves the blockage one step along. Smallest tid breaks ties.
+    let mut candidates: Vec<(usize, TaskKey)> = Vec::new();
     for res in seen.iter() {
+        let depth = graph.queue_depth_of(*res);
         for (task, r) in graph.blocked_on.iter() {
-            if r == res && task != &me && !candidates.contains(task) {
-                candidates.push(*task);
+            if r == res && task != &me && !candidates.iter().any(|(_, t)| t == task) {
+                candidates.push((depth, *task));
             }
         }
     }
-    candidates.sort_unstable();
-    match candidates.first() {
-        Some(victim) => {
-            let res = victim_res(&graph, *victim);
-            refuse_task(*victim, res);
-            false
-        }
-        // Nobody but us is parked mid-acquire: refuse the caller.
-        None => true,
+    // The caller is a candidate too: its queue depth counts the waiters that would
+    // sit ahead of it once it joins.
+    if !candidates.iter().any(|(_, t)| *t == me) {
+        candidates.push((graph.queue_depth_of(my_key), me));
     }
+    candidates.sort_unstable();
+    candidates[0].1
 }
 
-/// The resource a parked task is waiting on. `(0, 0)` only if it is not in the
-/// graph at all, which cannot happen for a candidate we just read out of it.
-fn victim_res(graph: &Graph, victim: TaskKey) -> ResKey {
-    graph.blocked_on(victim).unwrap_or((0, 0))
-}
-
-/// File a refusal for `victim` and wake it so its own syscall can return the code.
-fn refuse_task(victim: TaskKey, key: ResKey) {
+/// Refuse `victim`, which is parked in `key`'s queue.
+///
+/// The entry has to come out of the queue, otherwise the next `up`/`unlock` would
+/// hand a unit to a thread that has been told to fail and the grant counts would
+/// drift apart from the object's counter. [`unqueue`] drops it, then the task resumes
+/// inside its own syscall and reports the code through [`take_abort_for`].
+pub fn refuse_queued(victim: TaskKey, key: ResKey) {
     let process = match pid2process(victim.0) {
         Some(p) => p,
         None => return,
@@ -413,49 +451,100 @@ fn refuse_task(victim: TaskKey, key: ResKey) {
         Some(t) => t,
         None => return,
     };
-    PENDING.exclusive_access().push(Pending {
-        task: victim,
-        res: key,
-        code: DEADLOCK,
-    });
-    // Clear the parked-on marker so the walk no longer routes through it, then make
-    // the thread runnable: it resumes inside its own down/lock and picks the code up.
     {
         let mut tcb = task.inner_exclusive_access();
         if let Some(res) = tcb.res.as_mut() {
             res.blocked_in = None;
         }
     }
+    unqueue(&task, key);
+    ABORTED.exclusive_access().push(Abort {
+        task: victim,
+        key,
+        code: DEADLOCK,
+    });
     wakeup_task(task);
+}
+
+/// Hand the refusal to the chosen cycle member.
+///
+/// Returns `true` when somebody *else* was refused — the caller then joins the queue
+/// as normal, because the edge the graph keeps is the caller's. Returns `false` when
+/// the victim is the caller itself: there is nobody to pull out of the queue, and the
+/// primitive must fail its own acquire instead (a queued waiter implies the object
+/// owes that waiter a unit, so parking here would desynchronise counter and queue).
+pub fn refuse_if_not_me(victim: TaskKey, key: ResKey) -> bool {
+    let me = match current_key() {
+        Some(k) => k,
+        // No usable identity means we cannot be the victim; refuse whoever was named
+        // rather than letting the ring stay shut.
+        None => {
+            refuse_queued(victim, key);
+            return true;
+        }
+    };
+    if victim == me {
+        return false;
+    }
+    refuse_queued(victim, key);
+    true
+}
+
+/// Remove a task from an object's wait queue without granting it anything.
+///
+/// Queues are FIFO, but a refused victim can sit anywhere in one, so removal is by
+/// identity (`Arc::ptr_eq`) rather than position — the same reason grant counts are
+/// carried by the task instead of indexed by tid here.
+fn unqueue(task: &Arc<TaskControlBlock>, key: ResKey) {
+    let process = match pid2process(key.0) {
+        Some(p) => p,
+        None => return,
+    };
+    let (sem, mutex) = {
+        let inner = process.inner_exclusive_access();
+        (
+            semaphore_slot(&inner, key).and_then(|s| s.as_ref()).cloned(),
+            mutex_slot(&inner, key).and_then(|m| m.as_ref()).cloned(),
+        )
+    };
+    if let Some(sem) = sem {
+        sem.remove_waiter(task);
+        return;
+    }
+    if let Some(m) = mutex {
+        if let Some(b) = m.as_blocking() {
+            b.remove_waiter(task);
+        }
+    }
 }
 
 /// Pick up a refusal filed against the current task for `key`, if any.
 ///
-/// Called at the top of `sys_mutex_lock` / `sys_semaphore_down`, so a thread that
-/// was chosen as a victim while asleep reports `-0xdead` from its own syscall
-/// instead of being handed the resource it was punished for.
+/// Called at the top of the blocking acquire paths, so a thread chosen as a cycle
+/// victim while asleep reports `-0xdead` from its own syscall instead of being handed
+/// the resource it was punished for.
 pub fn take_abort_for(key: ResKey) -> Option<isize> {
     if !enabled() {
         return None;
     }
-    let me = match current_task().and_then(|t| self_key(&t)) {
+    let me = match current_key() {
         Some(k) => k,
         None => return None,
     };
-    let mut pending = PENDING.exclusive_access();
-    let pos = pending.iter().position(|p| p.task == me && p.res == key)?;
-    Some(pending.remove(pos).code)
+    let mut aborted = ABORTED.exclusive_access();
+    let pos = aborted.iter().position(|a| a.task == me && a.key == key)?;
+    Some(aborted.remove(pos).code)
 }
 
 /// Forget everything about a task that is exiting. Grant counts and the parked
-/// marker live in its own TCB, so dropping the TCB is enough; this only clears the
+/// marker live in its own TCB, so dropping the TCB is enough; this only clears
 /// queued refusals that could otherwise be replayed onto a recycled tid.
 pub fn forget_task(task: &Arc<TaskControlBlock>) {
     if !enabled() {
         return;
     }
     if let Some(me) = self_key(task) {
-        PENDING.exclusive_access().retain(|p| p.task != me);
+        ABORTED.exclusive_access().retain(|a| a.task != me);
     }
 }
 

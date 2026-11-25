@@ -25,7 +25,7 @@ use crate::timer::remove_timer;
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
 use manager::fetch_task;
-pub use process::ProcessControlBlock;
+pub use process::{ProcessControlBlock, ProcessControlBlockInner};
 use switch::__switch;
 
 pub use context::TaskContext;

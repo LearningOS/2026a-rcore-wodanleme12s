@@ -44,6 +44,16 @@ impl Mutex for MutexSpin {
         loop {
             let mut locked = self.locked.exclusive_access();
             if *locked {
+                // Drop the borrow *before* yielding. `exclusive_access` is a
+                // `RefCell::borrow_mut`, so holding it across
+                // `suspend_current_and_run_next` would keep the flag borrowed for
+                // as long as that task owns the CPU. The next holder of this mutex
+                // finishes by calling `unlock`, which borrows the very same cell —
+                // and a second `borrow_mut` on top of ours panics inside the kernel,
+                // where `trap_from_kernel` (`src/trap/mod.rs`) turns any panic into
+                // "the whole QEMU session is over". Whether the victim of that panic
+                // is another ch8 test or an unrelated one depends only on who gets
+                // scheduled after us, which is why the failure looks intermittent.
                 drop(locked);
                 suspend_current_and_run_next();
                 continue;
@@ -114,6 +124,19 @@ impl MutexBlocking {
             .map(|owner| Arc::ptr_eq(owner, task))
             .unwrap_or(false)
     }
+
+    /// Remove a specific waiter, by identity rather than position: a refused victim
+    /// can sit anywhere in a FIFO queue.
+    pub(crate) fn remove_waiter(&self, task: &Arc<TaskControlBlock>) {
+        let mut inner = self.inner.exclusive_access();
+        if let Some(pos) = inner
+            .wait_queue
+            .iter()
+            .position(|t| Arc::ptr_eq(t, task))
+        {
+            inner.wait_queue.remove(pos);
+        }
+    }
 }
 
 impl MutexBlockingInner {
@@ -145,7 +168,8 @@ impl Mutex for MutexBlocking {
             (inner.locked, inner.key)
         };
         // A refusal left for us by an earlier detection round wins: we were picked
-        // as a cycle victim while parked here.
+        // as a cycle victim while parked here. Checked before anything else so a
+        // punished thread never re-enters the queue it was pulled out of.
         if let Some(code) = deadlock::take_abort_for(key) {
             return code;
         }
@@ -160,10 +184,12 @@ impl Mutex for MutexBlocking {
             return 0;
         }
         // Contended: ask the detector before joining the queue.
-        if deadlock::check(key) {
-            return DEADLOCK;
-        }
         let task = current_task().unwrap();
+        if let Some(victim) = deadlock::check(key) {
+            if !deadlock::refuse_if_not_me(victim, key) {
+                return DEADLOCK;
+            }
+        }
         deadlock::park_me(key);
         {
             let mut inner = self.inner.exclusive_access();
