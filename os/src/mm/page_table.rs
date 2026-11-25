@@ -449,7 +449,12 @@ impl UserStaging {
                 let va = VirtAddr::from(pos + i);
                 match page_table.read_byte(va) {
                     Some(b) => {
-                        frame.ppn.get_bytes_array()[page_off + i] = b;
+                        // Byte `i` of the *request* lands at byte `i` of this
+                        // frame, not at `page_off + i`: `user_buffer` and `flush`
+                        // both address the frame from 0, so keeping the page
+                        // offset here would hand the file zeros for a buffer that
+                        // does not start on a page boundary.
+                        frame.ppn.get_bytes_array()[i] = b;
                         true
                     }
                     None => false,
