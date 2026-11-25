@@ -77,10 +77,6 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     );
     // take from Processor
     let task = take_current_task().unwrap();
-    // A task that dies parked on a mutex/semaphore must leave no wait-for edge
-    // behind, otherwise the detector would keep believing it is in somebody's
-    // queue. No-op while detection is disarmed.
-    crate::sync::deadlock::forget_task(&task);
     let mut task_inner = task.inner_exclusive_access();
     let process = task.process.upgrade().unwrap();
     let tid = task_inner.res.as_ref().unwrap().tid;

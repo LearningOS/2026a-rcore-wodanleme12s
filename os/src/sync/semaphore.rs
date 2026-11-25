@@ -14,12 +14,9 @@ pub struct Semaphore {
 /// The inner data of Semaphore
 pub struct SemaphoreInner {
     /// Available units. Negative means "these many tasks are parked and still
-    /// owed a unit", which is why `wait_queue` has exactly `-count` entries.
+    /// owed a unit", which is why `wait_queue` has exactly `-count` entries. The
+    /// detector reads this plus the queue, so nothing else is tracked here.
     pub count: isize,
-    /// Initial value passed to `semaphore_create`. Kept so that the number of
-    /// units currently handed out (`initial - count`) can be recovered by the
-    /// deadlock detector without maintaining a holder list here.
-    pub initial: isize,
     pub wait_queue: VecDeque<Arc<TaskControlBlock>>,
     /// Identity of this semaphore in the wait-for graph:
     /// `(pid, index in semaphore_list)`.
@@ -34,7 +31,6 @@ impl Semaphore {
             inner: unsafe {
                 UPSafeCell::new(SemaphoreInner {
                     count: res_count as isize,
-                    initial: res_count as isize,
                     wait_queue: VecDeque::new(),
                     key,
                 })
@@ -61,19 +57,6 @@ impl Semaphore {
             .collect()
     }
 
-    /// Remove a specific waiter from the queue, by identity rather than position:
-    /// a refused victim can sit anywhere in a FIFO queue.
-    pub(crate) fn remove_waiter(&self, task: &Arc<TaskControlBlock>) {
-        let mut inner = self.inner.exclusive_access();
-        if let Some(pos) = inner
-            .wait_queue
-            .iter()
-            .position(|t| Arc::ptr_eq(t, task))
-        {
-            inner.wait_queue.remove(pos);
-        }
-    }
-
     /// up operation of semaphore
     ///
     /// A released unit either goes straight to the head of the wait queue (when
@@ -81,26 +64,29 @@ impl Semaphore {
     /// becomes available for the next `down`. Only the bookkeeping differs: the
     /// woken task stops being a waiter and starts being a holder, while the second
     /// case just grows the pool. Nothing else has to be recomputed, because the
-    /// detector derives its graph from `count`/`initial` on the next acquire.
+    /// detector derives its state from `count` and the queue on the next acquire.
     pub fn up(&self) {
         trace!("kernel: Semaphore::up");
         let mut inner = self.inner.exclusive_access();
         inner.count += 1;
         let key = inner.key;
-        if inner.count <= 0 {
-            if let Some(task) = inner.wait_queue.pop_front() {
-                drop(inner);
-                // The unit goes straight to the head of the queue: that task stops
-                // waiting and starts holding, while we give one of ours back.
-                deadlock::release_me(&[key]);
-                deadlock::transfer(key, &task);
-                wakeup_task(task);
-                return;
-            }
-        }
+        let popped = if inner.count <= 0 {
+            inner.wait_queue.pop_front()
+        } else {
+            None
+        };
         drop(inner);
-        // Nobody was parked: the unit returns to the pool, so our grant count drops.
-        deadlock::release_me(&[key]);
+        if let Some(task) = popped {
+            // The unit goes straight to the head of the queue: that task stops
+            // waiting and starts holding, while we give one of ours back.
+            deadlock::release_me(&[key]);
+            deadlock::transfer(key, &task);
+            wakeup_task(task);
+        } else {
+            // Nobody was parked: the unit returns to the pool, so our grant
+            // count drops.
+            deadlock::release_me(&[key]);
+        }
     }
 
     /// down operation of semaphore
@@ -112,11 +98,6 @@ impl Semaphore {
             let inner = self.inner.exclusive_access();
             (inner.key, inner.count)
         };
-        // A refusal left for us by an earlier detection round wins over anything
-        // else: we were picked as a cycle victim while parked on this semaphore.
-        if let Some(code) = deadlock::take_abort_for(key) {
-            return code;
-        }
         if count > 0 {
             // A unit is there for the taking; no wait-for edge is ever created.
             let mut inner = self.inner.exclusive_access();
@@ -126,41 +107,24 @@ impl Semaphore {
             return 0;
         }
         // count <= 0: this down has to park somebody, so ask the detector first,
-        // before the count or the queue are touched.
+        // with neither the counter nor the queue touched. A refusal therefore leaves
+        // the object exactly as it found it — `count` only ever owes units to tasks it
+        // actually holds in `wait_queue`, which is the invariant the detector assumes.
+        if deadlock::would_deadlock(key) {
+            return DEADLOCK;
+        }
         let me = current_task().unwrap();
-        let victim = match deadlock::check(key) {
-            Some(v) => v,
-            None => {
-                deadlock::park_me(key);
-                {
-                    let mut inner = self.inner.exclusive_access();
-                    inner.count -= 1;
-                    inner.wait_queue.push_back(me);
-                    drop(inner);
-                    block_current_and_run_next();
-                }
-                // Resumed with a unit: `up` moved us out of the queue and recorded
-                // the grant for us, so only the parked marker is left to clear.
-                deadlock::clear_parked_me(key);
-                return 0;
-            }
-        };
-        // Somebody on the ring must be refused. When that is another task it is
-        // already queued, so `refuse_queued` pulls it out and wakes it; we then park
-        // as usual, because the edge the graph keeps is ours. When the victim *is*
-        // the caller there is nobody to pull out and joining the queue would be
-        // wrong — the object's counter only owes a unit to its queued waiters, so we
-        // return without touching either.
-        if deadlock::refuse_if_not_me(victim, key) {
-            deadlock::park_me(key);
+        deadlock::park_me(key);
+        {
             let mut inner = self.inner.exclusive_access();
             inner.count -= 1;
             inner.wait_queue.push_back(me);
             drop(inner);
             block_current_and_run_next();
-            deadlock::clear_parked_me(key);
-            return 0;
         }
-        DEADLOCK
+        // Resumed with a unit: `up` moved us out of the queue and recorded the grant
+        // for us, so only the parked marker is left to clear.
+        deadlock::clear_parked_me(key);
+        0
     }
 }

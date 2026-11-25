@@ -83,13 +83,13 @@ pub struct MutexBlocking {
 
 /// The state of a blocking mutex.
 ///
-/// `owner` is what makes the whole detection design work without a resource table:
-/// the object itself names who holds it, so the detector can ask instead of being
-/// told. It mirrors `locked` exactly.
+/// `locked` is the whole of the object's own truth: whether the unit is handed out.
+/// *Which* task holds it is not stored here but carried by that task's grant list, so
+/// the detector can rebuild the state without an owner field that has to be kept in
+/// step with the queue across a hand-off.
 pub struct MutexBlockingInner {
     pub(crate) locked: bool,
     pub(crate) wait_queue: VecDeque<Arc<TaskControlBlock>>,
-    pub(crate) owner: Option<Arc<TaskControlBlock>>,
     /// Identity of this mutex in the wait-for graph: `(pid, index in mutex_list)`.
     key: (usize, usize),
 }
@@ -103,7 +103,6 @@ impl MutexBlocking {
                 UPSafeCell::new(MutexBlockingInner {
                     locked: false,
                     wait_queue: VecDeque::new(),
-                    owner: None,
                     key,
                 })
             },
@@ -114,45 +113,12 @@ impl MutexBlocking {
     pub fn inner_ref(&self) -> core::cell::RefMut<'_, MutexBlockingInner> {
         self.inner.exclusive_access()
     }
-
-    /// Is the lock currently held by `task`?
-    pub fn is_held_by(&self, task: &Arc<TaskControlBlock>) -> bool {
-        let inner = self.inner.exclusive_access();
-        inner
-            .owner
-            .as_ref()
-            .map(|owner| Arc::ptr_eq(owner, task))
-            .unwrap_or(false)
-    }
-
-    /// Remove a specific waiter, by identity rather than position: a refused victim
-    /// can sit anywhere in a FIFO queue.
-    pub(crate) fn remove_waiter(&self, task: &Arc<TaskControlBlock>) {
-        let mut inner = self.inner.exclusive_access();
-        if let Some(pos) = inner
-            .wait_queue
-            .iter()
-            .position(|t| Arc::ptr_eq(t, task))
-        {
-            inner.wait_queue.remove(pos);
-        }
-    }
 }
 
 impl MutexBlockingInner {
     /// Tids parked in this mutex's queue.
     pub fn queued_tids(&self) -> Vec<usize> {
         crate::sync::semaphore::Semaphore::queued_tids(&self.wait_queue)
-    }
-
-    /// The tid of the current owner, if any.
-    pub fn owner_tid(&self) -> Option<usize> {
-        self.owner.as_ref().and_then(|t| {
-            t.inner_exclusive_access()
-                .res
-                .as_ref()
-                .map(|r| r.tid)
-        })
     }
 }
 
@@ -167,29 +133,19 @@ impl Mutex for MutexBlocking {
             let inner = self.inner.exclusive_access();
             (inner.locked, inner.key)
         };
-        // A refusal left for us by an earlier detection round wins: we were picked
-        // as a cycle victim while parked here. Checked before anything else so a
-        // punished thread never re-enters the queue it was pulled out of.
-        if let Some(code) = deadlock::take_abort_for(key) {
-            return code;
-        }
         if !locked {
             let mut inner = self.inner.exclusive_access();
-            let me = current_task().unwrap();
             inner.locked = true;
-            inner.owner = Some(Arc::clone(&me));
-            let key = inner.key;
             drop(inner);
             deadlock::grant_me(key);
             return 0;
         }
-        // Contended: ask the detector before joining the queue.
-        let task = current_task().unwrap();
-        if let Some(victim) = deadlock::check(key) {
-            if !deadlock::refuse_if_not_me(victim, key) {
-                return DEADLOCK;
-            }
+        // Contended: ask the detector before joining the queue, while nothing has
+        // been changed. A refusal leaves the queue and the flag as they were.
+        if deadlock::would_deadlock(key) {
+            return DEADLOCK;
         }
+        let task = current_task().unwrap();
         deadlock::park_me(key);
         {
             let mut inner = self.inner.exclusive_access();
@@ -210,12 +166,9 @@ impl Mutex for MutexBlocking {
         if !mutex_inner.locked {
             return false;
         }
-        // The lock belongs to nobody in the instant between here and the hand-off.
-        mutex_inner.owner = None;
         if let Some(waking_task) = mutex_inner.wait_queue.pop_front() {
-            // Ownership transfers straight to the head of the queue.
-            mutex_inner.locked = true;
-            mutex_inner.owner = Some(Arc::clone(&waking_task));
+            // The unit goes straight from us to the head of the queue: the flag stays
+            // set, because the lock belongs to that task from this instant on.
             let key = mutex_inner.key;
             drop(mutex_inner);
             deadlock::release_me(&[key]);

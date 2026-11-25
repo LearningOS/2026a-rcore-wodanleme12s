@@ -5,6 +5,7 @@ use crate::{
         current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
         suspend_current_and_run_next, SignalFlags,
     },
+    timer::get_time_us,
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
 
@@ -151,12 +152,27 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+/// Report the time since boot, split into seconds and microseconds.
+///
+/// `user_lib::sleep` is a user-space wait that polls this and yields, and
+/// `get_time()` folds the two fields back into milliseconds — so the values have
+/// to come from one reading of the same counter the kernel's timers use, and the
+/// seconds field must stay small enough for that arithmetic to work.
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_get_time",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let now_us = get_time_us();
+    let now = TimeVal {
+        sec: now_us / 1_000_000,
+        usec: now_us % 1_000_000,
+    };
+    let process = current_process();
+    let token = process.inner_exclusive_access().memory_set.token();
+    drop(process);
+    *translated_refmut(token, ts) = now;
+    0
 }
 
 /// mmap syscall
