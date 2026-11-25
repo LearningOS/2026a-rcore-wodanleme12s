@@ -43,7 +43,12 @@ lazy_static! {
                     end = end.add(1);
                 }
                 let slice = core::slice::from_raw_parts(start, end as usize - start as usize);
+                // App names are emitted by build.rs as `.string "ch4_mmap0"`
+                // while the syscall callers pass the C string they were given,
+                // typically `"ch4_mmap0\0"`. Compare without any trailing NUL so
+                // both spellings resolve to the same application.
                 let str = core::str::from_utf8(slice).unwrap();
+                let str = str.strip_suffix('\0').unwrap_or(str);
                 v.push(str);
                 start = end.add(1);
             }
@@ -55,6 +60,9 @@ lazy_static! {
 #[allow(unused)]
 ///get app data from name
 pub fn get_app_data_by_name(name: &str) -> Option<&'static [u8]> {
+    // Same normalisation as APP_NAMES: a caller may hand us the C string with
+    // its terminator, or the plain Rust `&str`.
+    let name = name.strip_suffix('\0').unwrap_or(name);
     let num_app = get_num_app();
     (0..num_app)
         .find(|&i| APP_NAMES[i] == name)

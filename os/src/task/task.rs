@@ -11,6 +11,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
 
+/// Weight used by tasks that never called `sys_set_priority`.
+pub const DEFAULT_PRIORITY: usize = 5;
+
 /// Task control block structure
 ///
 /// Directly save the contents that will not change during running
@@ -64,6 +67,8 @@ pub struct TaskControlBlockInner {
 
     /// It is set when active exit or execution error occurs
     pub exit_code: i32,
+    /// Open files, indexed by file descriptor. `None` marks a closed slot that
+    /// [`TaskControlBlockInner::alloc_fd`] can hand out again.
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
 
     /// Heap bottom
@@ -71,6 +76,22 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Stride-scheduling weight: CPU time is shared in proportion to this.
+    /// Always `>= 1`, so the pass increment in [`crate::task`] cannot divide by zero.
+    pub priority: usize,
+
+    /// Virtual time already charged to this task, in stride units. A task
+    /// becomes runnable again with `pass += WEIGHT / priority`, so a large
+    /// priority charges little virtual time and gets picked more often.
+    pub stride_pass: usize,
+
+    /// Monotonic tie-breaker handed out at (re)enqueue time, so two tasks with
+    /// the same pass run in the order they became ready.
+    pub stride_seq: u64,
+
+    /// Tick at which a `Blocked` task becomes runnable again (`sys_sleep`).
+    pub wake_ticks: usize,
 }
 
 impl TaskControlBlockInner {
@@ -83,8 +104,9 @@ impl TaskControlBlockInner {
     fn get_status(&self) -> TaskStatus {
         self.task_status
     }
-    pub fn is_zombie(&self) -> bool {
-        self.get_status() == TaskStatus::Zombie
+    /// A task that has run to completion but has not been reaped by its parent.
+    pub fn is_exited(&self) -> bool {
+        self.get_status() == TaskStatus::Exited
     }
     pub fn alloc_fd(&mut self) -> usize {
         if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
@@ -135,6 +157,10 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    priority: DEFAULT_PRIORITY,
+                    stride_pass: 0,
+                    stride_seq: 0,
+                    wake_ticks: 0,
                 })
             },
         };
@@ -216,6 +242,10 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    priority: parent_inner.priority,
+                    stride_pass: parent_inner.stride_pass,
+                    stride_seq: 0,
+                    wake_ticks: 0,
                 })
             },
         });
@@ -234,6 +264,17 @@ impl TaskControlBlock {
     /// get pid of process
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    /// Re-weight this task for the stride scheduler.
+    ///
+    /// Only this task's own pass is re-based (to the smallest pass currently in
+    /// the ready queue); the rest of the queue is left untouched, which is what
+    /// keeps a priority change from wrapping the global counter.
+    pub fn set_priority(&self, priority: usize) {
+        let mut inner = self.inner_exclusive_access();
+        inner.priority = priority.max(1);
+        inner.stride_pass = crate::task::min_runnable_pass();
     }
 
     /// change the location of the program break. return None if failed.
@@ -264,7 +305,7 @@ impl TaskControlBlock {
 }
 
 #[derive(Copy, Clone, PartialEq)]
-/// task status: UnInit, Ready, Running, Exited
+/// task status: UnInit, Ready, Running, Exited, Blocked
 pub enum TaskStatus {
     /// uninitialized
     UnInit,
@@ -272,6 +313,8 @@ pub enum TaskStatus {
     Ready,
     /// running
     Running,
-    /// exited
-    Zombie,
+    /// finished, waiting to be reaped by its parent
+    Exited,
+    /// parked until a timer deadline (`sys_sleep`) wakes it
+    Blocked,
 }

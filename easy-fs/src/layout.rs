@@ -85,6 +85,9 @@ pub struct DiskInode {
     pub direct: [u32; INODE_DIRECT_COUNT],
     pub indirect1: u32,
     pub indirect2: u32,
+    /// Hard-link count. `0` is what the tutorial image leaves behind, so every
+    /// accessor normalises it to `1` on read; see `nlink()` / `inc_nlink()` below.
+    pub nlink: u32,
     type_: DiskInodeType,
 }
 
@@ -93,10 +96,26 @@ impl DiskInode {
     /// indirect1 and indirect2 block are allocated only when they are needed
     pub fn initialize(&mut self, type_: DiskInodeType) {
         self.size = 0;
+        self.nlink = 1;
         self.direct.iter_mut().for_each(|v| *v = 0);
         self.indirect1 = 0;
         self.indirect2 = 0;
         self.type_ = type_;
+    }
+    /// Hard-link count as seen by `fstat`. A freshly packed image never wrote
+    /// this field, so treat `0` as "one link" instead of reporting an impossible
+    /// zero for a file that is clearly present in its parent directory.
+    pub fn nlink(&self) -> u32 {
+        self.nlink.max(1)
+    }
+    /// Add one hard link to this inode.
+    pub fn inc_nlink(&mut self) {
+        self.nlink = self.nlink() + 1;
+    }
+    /// Drop one hard link; returns the remaining count (`0` => last link gone).
+    pub fn dec_nlink(&mut self) -> u32 {
+        self.nlink = self.nlink().saturating_sub(1);
+        self.nlink
     }
     /// Whether this inode is a directory
     pub fn is_dir(&self) -> bool {

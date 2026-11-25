@@ -14,10 +14,14 @@
 const SYSCALL_UNLINKAT: usize = 35;
 /// linkat syscall
 const SYSCALL_LINKAT: usize = 37;
+/// dup syscall
+const SYSCALL_DUP: usize = 24;
 /// open syscall
 const SYSCALL_OPEN: usize = 56;
 /// close syscall
 const SYSCALL_CLOSE: usize = 57;
+/// pipe syscall
+const SYSCALL_PIPE: usize = 59;
 /// read syscall
 const SYSCALL_READ: usize = 63;
 /// write syscall
@@ -26,6 +30,8 @@ const SYSCALL_WRITE: usize = 64;
 const SYSCALL_FSTAT: usize = 80;
 /// exit syscall
 const SYSCALL_EXIT: usize = 93;
+/// sleep syscall (used by the blocking `user_lib::sleep_blocking`)
+const SYSCALL_SLEEP: usize = 101;
 /// yield syscall
 const SYSCALL_YIELD: usize = 124;
 /// setpriority syscall
@@ -62,8 +68,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 4]) -> isize {
     match syscall_id {
         SYSCALL_OPEN => sys_open(args[1] as *const u8, args[2] as u32),
         SYSCALL_CLOSE => sys_close(args[0]),
+        SYSCALL_DUP => sys_dup(args[0]),
         SYSCALL_LINKAT => sys_linkat(args[1] as *const u8, args[3] as *const u8),
         SYSCALL_UNLINKAT => sys_unlinkat(args[1] as *const u8),
+        SYSCALL_PIPE => sys_pipe(args[1] as *mut [usize; 2]),
         SYSCALL_READ => sys_read(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut Stat),
@@ -79,6 +87,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 4]) -> isize {
         SYSCALL_SBRK => sys_sbrk(args[0] as i32),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
+        SYSCALL_SLEEP => sys_sleep(args[0]),
         _ => panic!("Unsupported syscall_id: {}", syscall_id),
     }
 }

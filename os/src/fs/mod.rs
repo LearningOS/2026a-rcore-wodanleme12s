@@ -1,12 +1,18 @@
 //! File trait & inode(dir, file, pipe, stdin, stdout)
 
 mod inode;
+mod pipe;
 mod stdio;
 
 use crate::mm::UserBuffer;
+use core::any::Any;
 
 /// trait File for all file types
-pub trait File: Send + Sync {
+///
+/// `Any` is the price of `sys_fstat`: descriptors arrive as trait objects and only
+/// `OSInode` has on-disk metadata, so the syscall has to recover the concrete type
+/// instead of guessing from the fd number.
+pub trait File: Send + Sync + Any {
     /// the file readable?
     fn readable(&self) -> bool;
     /// the file writable?
@@ -15,11 +21,13 @@ pub trait File: Send + Sync {
     fn read(&self, buf: UserBuffer) -> usize;
     /// write to the file from buf, return the number of bytes written
     fn write(&self, buf: UserBuffer) -> usize;
+    /// Reveal the concrete type behind `dyn File`.
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// The stat of a inode
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Stat {
     /// ID of device containing file
     pub dev: u64,
@@ -46,5 +54,8 @@ bitflags! {
     }
 }
 
-pub use inode::{list_apps, open_file, OSInode, OpenFlags};
+pub use inode::{
+    link_in_root, list_apps, open_file, unlink_in_root, OSInode, OpenFlags,
+};
+pub use pipe::{pipe_pair, PipeReader, PipeWriter};
 pub use stdio::{Stdin, Stdout};

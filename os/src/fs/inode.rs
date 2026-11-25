@@ -4,7 +4,7 @@
 //!
 //! `UPSafeCell<OSInodeInner>` -> `OSInode`: for static `ROOT_INODE`,we
 //! need to wrap `OSInodeInner` into `UPSafeCell`
-use super::File;
+use super::{File, Stat, StatMode};
 use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
@@ -125,12 +125,43 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     }
 }
 
+impl OSInode {
+    /// Fill a `struct stat` from the on-disk inode this handle points at.
+    pub fn stat(&self) -> Stat {
+        let inner = self.inner.exclusive_access();
+        Stat {
+            // One virtio-blk device in this system, so the device id is constant;
+            // `ch6_file2` only compares it against another stat of the same file.
+            dev: 0,
+            ino: inner.inode.inode_id() as u64,
+            mode: StatMode::FILE,
+            nlink: inner.inode.nlink(),
+            pad: [0; 7],
+        }
+    }
+}
+
+/// `link(old, new)` for the shell's flat namespace: every file the tests touch
+/// lives directly in `/`, so the root inode is both the lookup directory and the
+/// place the new dirent is written.
+pub fn link_in_root(old_name: &str, new_name: &str) -> bool {
+    ROOT_INODE.link(old_name, new_name)
+}
+
+/// `unlink(name)`: drop one dirent (and, for the last name, the file itself).
+pub fn unlink_in_root(name: &str) -> bool {
+    ROOT_INODE.unlink(name)
+}
+
 impl File for OSInode {
     fn readable(&self) -> bool {
         self.readable
     }
     fn writable(&self) -> bool {
         self.writable
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
     }
     fn read(&self, mut buf: UserBuffer) -> usize {
         let mut inner = self.inner.exclusive_access();
@@ -145,10 +176,18 @@ impl File for OSInode {
         }
         total_read_size
     }
+    /// Write through the file's current offset, extending it when needed.
+    ///
+    /// easy-fs' `DiskInode::write_at` clamps to the existing size (it is written
+    /// for `create`, whose fresh inode has `size == 0`), so a plain `write_at`
+    /// onto a new file would silently store nothing at all — every `Test fileN`
+    /// assertion would then compare an empty read-back. Growing first makes the
+    /// tutorial's `open(CREATE|WRONLY)` + `write` sequence behave like POSIX.
     fn write(&self, buf: UserBuffer) -> usize {
         let mut inner = self.inner.exclusive_access();
         let mut total_write_size = 0usize;
         for slice in buf.buffers.iter() {
+            inner.inode.resize_to(inner.offset + slice.len());
             let write_size = inner.inode.write_at(inner.offset, *slice);
             assert_eq!(write_size, slice.len());
             inner.offset += write_size;

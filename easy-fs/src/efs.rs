@@ -121,6 +121,16 @@ impl EasyFileSystem {
             (inode_id % inodes_per_block) as usize * inode_size,
         )
     }
+    /// Which inode number lives at `(block_id, block_offset)` — the inverse of
+    /// [`get_disk_inode_pos`]. A vfs `Inode` only remembers its disk position,
+    /// but `fstat` has to report `stat.ino`, i.e. the number that two hard-linked
+    /// names share.
+    pub fn inode_id_of(&self, block_id: u32, block_offset: usize) -> u32 {
+        let inode_size = core::mem::size_of::<DiskInode>();
+        let inodes_per_block = (BLOCK_SZ / inode_size) as u32;
+        (block_id - self.inode_area_start_block) * inodes_per_block
+            + (block_offset / inode_size) as u32
+    }
     /// Get data block by id
     pub fn get_data_block_id(&self, data_block_id: u32) -> u32 {
         self.data_area_start_block + data_block_id
@@ -130,6 +140,14 @@ impl EasyFileSystem {
         self.inode_bitmap.alloc(&self.block_device).unwrap() as u32
     }
 
+    /// Release an inode slot so `alloc_inode` can hand it out again.
+    ///
+    /// This is what makes the "mass open/unlink" test survive: without it the
+    /// inode bitmap only ever fills up, and the 4095th `create` dies in
+    /// `alloc_inode().unwrap()`.
+    pub fn dealloc_inode(&mut self, inode_id: u32) {
+        self.inode_bitmap.dealloc(&self.block_device, inode_id as usize);
+    }
     /// Allocate a data block
     pub fn alloc_data(&mut self) -> u32 {
         self.data_bitmap.alloc(&self.block_device).unwrap() as u32 + self.data_area_start_block

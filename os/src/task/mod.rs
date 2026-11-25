@@ -19,19 +19,19 @@ mod manager;
 mod processor;
 mod switch;
 #[allow(clippy::module_inception)]
-#[allow(rustdoc::private_intra_doc_links)]
 mod task;
 
 use crate::fs::{open_file, OpenFlags};
+use crate::sync::UPSafeCell;
 use alloc::sync::Arc;
-pub use context::TaskContext;
+use alloc::vec::Vec;
 use lazy_static::*;
-pub use manager::{fetch_task, TaskManager};
+pub use manager::{add_task, fetch_task, min_runnable_pass, TaskManager};
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
 
+pub use context::TaskContext;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-pub use manager::add_task;
 pub use processor::{
     current_task, current_trap_cx, current_user_token, run_tasks, schedule, take_current_task,
     Processor,
@@ -55,6 +55,49 @@ pub fn suspend_current_and_run_next() {
     schedule(task_cx_ptr);
 }
 
+/// Park the current task until `ticks` timer ticks have passed.
+///
+/// The task deliberately does *not* go back into the ready queue: it is
+/// `Blocked`, and [`check_timeout`] re-admits it when its deadline arrives. That
+/// keeps a sleeping process from eating stride weight (which would make
+/// `set_priority` meaningless) while still letting the clock, not the task,
+/// decide when it wakes.
+pub fn wait_for_ticks(ticks: usize) {
+    let task = take_current_task().unwrap();
+    let (task_cx_ptr, deadline) = {
+        let mut inner = task.inner_exclusive_access();
+        inner.task_status = TaskStatus::Blocked;
+        inner.wake_ticks = crate::timer::get_time() + ticks;
+        (&mut inner.task_cx as *mut TaskContext, inner.wake_ticks)
+    };
+    BLOCKED_TASKS.exclusive_access().push((deadline, task));
+    schedule(task_cx_ptr);
+}
+
+/// Re-admit every task whose sleep deadline has passed. Runs on the tick,
+/// before the scheduler picks the next process, so a sleeper resumes exactly on
+/// the first tick after its deadline — never because it polled the clock.
+pub fn check_timeout() {
+    let now = crate::timer::get_time();
+    let mut blocked = BLOCKED_TASKS.exclusive_access();
+    let mut wakees = Vec::new();
+    blocked.retain(|(deadline, task)| {
+        if *deadline <= now {
+            // Only the owner of a Blocked entry may flip it to Ready; that is
+            // what makes this list the single source of truth for sleepers.
+            task.inner_exclusive_access().task_status = TaskStatus::Ready;
+            wakees.push(task.clone());
+            false
+        } else {
+            true
+        }
+    });
+    drop(blocked);
+    for task in wakees {
+        add_task(task);
+    }
+}
+
 /// pid of usertests app in make run TEST=1
 pub const IDLE_PID: usize = 0;
 
@@ -74,8 +117,9 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 
     // **** access current TCB exclusively
     let mut inner = task.inner_exclusive_access();
-    // Change status to Zombie
-    inner.task_status = TaskStatus::Zombie;
+    // Change status to Exited: the task no longer runs, but its TCB (and exit
+    // code) stays alive until a parent reaps it with wait/waitpid.
+    inner.task_status = TaskStatus::Exited;
     // Record exit code
     inner.exit_code = exit_code;
     // do not move to its parent but under initproc
@@ -93,7 +137,8 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     inner.children.clear();
     // deallocate user space
     inner.memory_set.recycle_data_pages();
-    // drop file descriptors
+    // drop file descriptors: the last Arc going away is what frees an inode's
+    // data blocks in `unlinkat`, so an exiting process must not keep them alive.
     inner.fd_table.clear();
     drop(inner);
     // **** release current PCB
@@ -105,10 +150,24 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 }
 
 lazy_static! {
+    /// Tasks parked by `sys_sleep`, as (wake-up tick, TCB).
+    ///
+    /// A separate list rather than a slot inside the ready heap: an entry in the
+    /// heap carries the key it was pushed with, so a task that changed its own
+    /// priority while sleeping would be impossible to find without scanning.
+    pub static ref BLOCKED_TASKS: UPSafeCell<Vec<(usize, Arc<TaskControlBlock>)>> =
+        unsafe { UPSafeCell::new(Vec::new()) };
+}
+
+lazy_static! {
     /// Creation of initial process
     ///
     /// the name "initproc" may be changed to any other app name like "usertests",
     /// but we have user_shell, so we don't need to change it.
+    ///
+    /// From this chapter on the init program is read out of the disk image rather
+    /// than baked into the kernel as an ELF blob: `easy-fs` holds every user app as
+    /// a file in the root directory, and `open_file` + `read_all` give us its bytes.
     pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new({
         let inode = open_file("ch6b_initproc", OpenFlags::RDONLY).unwrap();
         let v = inode.read_all();

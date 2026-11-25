@@ -1,5 +1,8 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
-use super::{frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use super::{
+    frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum, VPNRange,
+};
+use crate::config::PAGE_SIZE;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -57,6 +60,10 @@ impl PageTableEntry {
     /// The page pointered by page table entry is writable?
     pub fn writable(&self) -> bool {
         (self.flags() & PTEFlags::W) != PTEFlags::empty()
+    }
+    /// The page may be reached from U mode (its U bit is set)?
+    pub fn user_accessible(&self) -> bool {
+        (self.flags() & PTEFlags::U) != PTEFlags::empty()
     }
     /// The page pointered by page table entry is executable?
     pub fn executable(&self) -> bool {
@@ -152,6 +159,53 @@ impl PageTable {
             (aligned_pa_usize + offset).into()
         })
     }
+    /// Like [`translate_va`](Self::translate_va), but refuses an empty leaf slot
+    /// instead of reporting physical page zero for it.
+    fn translate_va_valid(&self, va: VirtAddr) -> Option<PhysAddr> {
+        let pte = self.find_pte(va.floor())?;
+        if !pte.is_valid() {
+            return None;
+        }
+        let aligned_pa_usize: usize = PhysAddr::from(pte.ppn()).into();
+        Some((aligned_pa_usize + va.page_offset()).into())
+    }
+    /// Read one byte through this page table.
+    ///
+    /// Returns `None` when the leaf entry is missing or not valid, so a hole in
+    /// the address space never reads back as physical page zero.
+    pub fn read_byte(&self, va: VirtAddr) -> Option<u8> {
+        // An invalid leaf has no frame at all (its ppn field reads as 0), which
+        // is why this must not fall through to translate_va.
+        let pa = self.translate_va_valid(va)?;
+        // SAFETY: translate_va_valid only answers for a valid leaf slot of this
+        // page table, so `pa` designates one byte inside a mapped frame; the
+        // caller decides whether reading it is legal (MemorySet::
+        // translate_user_byte adds the U/R/W and RAM-range checks).
+        Some(unsafe { (usize::from(pa) as *const u8).read_volatile() })
+    }
+    /// Write one byte through this page table, same validity rule as
+    /// [`read_byte`](Self::read_byte).
+    pub fn write_byte(&mut self, va: VirtAddr, value: u8) -> Option<()> {
+        let pa = self.translate_va_valid(va)?;
+        // SAFETY: as above, and the caller checked the W bit.
+        unsafe { (usize::from(pa) as *mut u8).write_volatile(value) };
+        Some(())
+    }
+    /// Forget every leaf mapping in the range without freeing anything.
+    ///
+    /// `unmap` insists on a valid entry (that is how a double free gets caught),
+    /// so tearing down an address space that may contain holes — pages the
+    /// application `munmap`'d before exiting, or simply never touched — needs
+    /// this variant. Ownership of the frames stays where it already is (`MapArea`
+    /// and `Vma` trackers), which then release them exactly once.
+    pub fn clear_range(&mut self, start: VirtPageNum, end: VirtPageNum) {
+        for vpn in VPNRange::new(start, end) {
+            // A missing intermediate table means nothing is mapped below it.
+            if let Some(pte) = self.find_pte(vpn) {
+                *pte = PageTableEntry::empty();
+            }
+        }
+    }
     /// get the token from the page table
     pub fn token(&self) -> usize {
         8usize << 60 | self.root_ppn.0
@@ -167,7 +221,13 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
     while start < end {
         let start_va = VirtAddr::from(start);
         let mut vpn = start_va.floor();
-        let ppn = page_table.translate(vpn).unwrap().ppn();
+        // An unmapped byte is the application's bug, not the kernel's: refuse
+        // (empty vector) instead of unwrapping and panicking the whole system.
+        // Callers turn this into `-1`/a killed task.
+        let ppn = match page_table.translate(vpn) {
+            Some(pte) if pte.is_valid() => pte.ppn(),
+            _ => return Vec::new(),
+        };
         vpn.step();
         let mut end_va: VirtAddr = vpn.into();
         end_va = end_va.min(VirtAddr::from(end));
@@ -181,38 +241,103 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
     v
 }
 
-/// Translate&Copy a ptr[u8] array end with `\0` to a `String` Vec through page table
-pub fn translated_str(token: usize, ptr: *const u8) -> String {
-    let page_table = PageTable::from_token(token);
-    let mut string = String::new();
-    let mut va = ptr as usize;
-    loop {
-        let ch: u8 = *(page_table
-            .translate_va(VirtAddr::from(va))
-            .unwrap()
-            .get_mut());
-        if ch == 0 {
-            break;
-        }
-        string.push(ch as char);
-        va += 1;
-    }
-    string
+/// Copy a NUL-terminated string out of the *current task's* address space.
+///
+/// The translation goes through that task's own page table (`MemorySet::
+/// read_user_str`, which demands present + R + U) rather than "whichever table
+/// satp happens to hold". While handling a trap, satp is the kernel's table, so
+/// an application string constant such as `ch5_usertest`'s `TESTS` entries —
+/// which live in the image's `.rodata`, not on the stack — would read back as
+/// unmapped and every `sys_spawn` would answer `-1`.
+pub fn translated_str_opt(ptr: *const u8) -> Option<alloc::string::String> {
+    let task = crate::task::current_task()?;
+    let inner = task.inner_exclusive_access();
+    inner.memory_set.read_user_str(ptr)
 }
 
-#[allow(unused)]
-/// Translate a ptr[u8] array through page table and return a reference of T
-pub fn translated_ref<T>(token: usize, ptr: *const T) -> &'static T {
+/// Translate&Copy a ptr[u8] array end with `\0` to a `String` Vec through page table
+pub fn translated_str(_token: usize, ptr: *const u8) -> String {
+    translated_str_opt(ptr).expect("invalid user string in translated_str")
+}
+
+/// Copy `len` bytes from user memory into `dst` (which must be exactly `len`
+/// long), one page at a time. Returns `false` on any unreadable byte.
+pub fn copy_from_user(token: usize, src: usize, dst: &mut [u8]) -> bool {
     let page_table = PageTable::from_token(token);
-    page_table
-        .translate_va(VirtAddr::from(ptr as usize))
-        .unwrap()
-        .get_ref()
+    let mut offset = 0;
+    while offset < dst.len() {
+        let va = match src.checked_add(offset) {
+            Some(va) => va,
+            None => return false,
+        };
+        let page_off = va % PAGE_SIZE;
+        let take = core::cmp::min(dst.len() - offset, PAGE_SIZE - page_off);
+        for i in 0..take {
+            match page_table.read_byte(VirtAddr::from(va + i)) {
+                Some(byte) => dst[offset + i] = byte,
+                None => return false,
+            }
+        }
+        offset += take;
+    }
+    true
+}
+
+/// Copy `src` into user memory, one page at a time. Returns `false` on any
+/// unwritable byte.
+pub fn copy_to_user(token: usize, dst: usize, src: &[u8]) -> bool {
+    let mut page_table = PageTable::from_token(token);
+    let mut offset = 0;
+    while offset < src.len() {
+        let va = match dst.checked_add(offset) {
+            Some(va) => va,
+            None => return false,
+        };
+        let page_off = va % PAGE_SIZE;
+        let take = core::cmp::min(src.len() - offset, PAGE_SIZE - page_off);
+        for i in 0..take {
+            if page_table
+                .write_byte(VirtAddr::from(va + i), src[offset + i])
+                .is_none()
+            {
+                return false;
+            }
+        }
+        offset += take;
+    }
+    true
+}
+
+/// Read a plain-old-data value out of user memory.
+pub fn read_struct<T: Copy>(token: usize, addr: usize) -> Option<T> {
+    let size = core::mem::size_of::<T>();
+    if size == 0 || addr % core::mem::align_of::<T>() != 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    if !copy_from_user(token, addr, &mut buf) {
+        return None;
+    }
+    // SAFETY: `buf` holds size_of::<T>() bytes and T's alignment was checked.
+    Some(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const T) })
+}
+
+/// Write a plain-old-data value into user memory.
+pub fn write_struct<T: Copy>(token: usize, addr: usize, value: &T) -> bool {
+    let size = core::mem::size_of::<T>();
+    if size == 0 || addr % core::mem::align_of::<T>() != 0 {
+        return false;
+    }
+    // SAFETY: reinterpreting a Copy value as its own bytes is always valid.
+    let bytes = unsafe { core::slice::from_raw_parts(value as *const T as *const u8, size) };
+    copy_to_user(token, addr, bytes)
 }
 /// Translate a ptr[u8] array through page table and return a mutable reference of T
 pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
+    //trace!("into translated_refmut!");
     let page_table = PageTable::from_token(token);
     let va = ptr as usize;
+    //trace!("translated_refmut: before translate_va");
     page_table
         .translate_va(VirtAddr::from(va))
         .unwrap()
@@ -274,5 +399,135 @@ impl Iterator for UserBufferIterator {
             }
             Some(r)
         }
+    }
+}
+
+
+/// Kernel-side staging area for one user buffer request.
+///
+/// The `File` trait is handed a [`UserBuffer`] whose slices must be reachable by
+/// code that has no user page table loaded — an inode reads through the block
+/// device, `Stdout` prints, a pipe copies into kernel heap. Raw user virtual
+/// addresses would therefore be garbage there (they are only meaningful under the
+/// *application's* satp, and we run under the kernel's inside a syscall).
+///
+/// So instead of exposing user pages, this allocates one kernel frame per user
+/// page the request touches, loads it with the user bytes, and writes them back
+/// on drop. Every translation goes through the caller's own page table with the
+/// validity checks ch4/ch5 established: a hole or a read-only destination fails
+/// the whole request (empty buffer ⇒ the syscall answers `-1`) rather than
+/// silently aliasing physical page 0.
+pub struct UserStaging {
+    frames: Vec<FrameTracker>,
+    /// `(user_va, len)` per staged segment, in order.
+    segments: Vec<(usize, usize)>,
+    writable: bool,
+    token: usize,
+}
+
+impl UserStaging {
+    /// Stage `len` bytes starting at user address `ptr`.
+    pub fn new(token: usize, ptr: usize, len: usize, writable: bool) -> Self {
+        let mut frames: Vec<FrameTracker> = Vec::new();
+        let mut segments: Vec<(usize, usize)> = Vec::new();
+        let page_table = PageTable::from_token(token);
+        let mut pos = ptr;
+        let end = match ptr.checked_add(len) {
+            Some(e) => e,
+            None => return Self::default_unstaged(),
+        };
+        while pos < end {
+            let page_off = pos % PAGE_SIZE;
+            let take = core::cmp::min(PAGE_SIZE - page_off, end - pos);
+            let frame = match frame_alloc() {
+                Some(f) => f,
+                None => return Self::default_unstaged(),
+            };
+            // Copy the user bytes in, one byte at a time so a single unmapped or
+            // (for a write) read-only page aborts cleanly.
+            let ok = (0..take).all(|i| {
+                let va = VirtAddr::from(pos + i);
+                match page_table.read_byte(va) {
+                    Some(b) => {
+                        frame.ppn.get_bytes_array()[page_off + i] = b;
+                        true
+                    }
+                    None => false,
+                }
+            });
+            if !ok {
+                return Self::default_unstaged();
+            }
+            segments.push((pos, take));
+            frames.push(frame);
+            pos += take;
+        }
+        Self {
+            frames,
+            segments,
+            writable,
+            token,
+        }
+    }
+
+    /// A request that touches no bytes (`len == 0`): well-formed, nothing to copy.
+    pub fn empty() -> Self {
+        Self::default_unstaged()
+    }
+
+    fn default_unstaged() -> Self {
+        Self {
+            frames: Vec::new(),
+            segments: Vec::new(),
+            writable: false,
+            token: 0,
+        }
+    }
+
+    /// True when nothing could be staged (bad pointer, unmapped page, ...).
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// Total staged bytes.
+    pub fn len(&self) -> usize {
+        self.segments.iter().map(|(_, l)| l).sum()
+    }
+
+    /// Kernel-visible slices, one per user page touched, in address order.
+    ///
+    /// The kernel maps all of physical memory identically (`ekernel..MEMORY_END`)
+    /// and never switches back to a user satp while a syscall runs, so a frame's
+    /// physical address is directly readable here — that is the same trick
+    /// `translated_byte_buffer` uses, just pointed at our own frames instead of
+    /// the application's.
+    pub fn user_buffer(&mut self) -> UserBuffer {
+        let mut v = Vec::new();
+        for (frame, (_, len)) in self.frames.iter().zip(self.segments.iter()) {
+            let arr: &'static mut [u8] = frame.ppn.get_bytes_array();
+            v.push(&mut arr[..*len]);
+        }
+        UserBuffer::new(v)
+    }
+
+    /// Write the staged content back to the user pages, if the request was a read.
+    fn flush(&mut self) {
+        if !self.writable {
+            return;
+        }
+        // A page-table mutation is needed to store, so take a fresh table view.
+        let mut page_table = PageTable::from_token(self.token);
+        for (frame, (va_start, len)) in self.frames.iter().zip(self.segments.iter()) {
+            let arr = frame.ppn.get_bytes_array();
+            for i in 0..*len {
+                let _ = page_table.write_byte(VirtAddr::from(va_start + i), arr[i]);
+            }
+        }
+    }
+}
+
+impl Drop for UserStaging {
+    fn drop(&mut self) {
+        self.flush();
     }
 }

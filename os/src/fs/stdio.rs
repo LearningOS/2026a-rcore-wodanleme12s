@@ -14,6 +14,9 @@ impl File for Stdin {
     fn readable(&self) -> bool {
         true
     }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
     fn writable(&self) -> bool {
         false
     }
@@ -44,6 +47,9 @@ impl File for Stdin {
 impl File for Stdout {
     fn readable(&self) -> bool {
         false
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
     }
     fn writable(&self) -> bool {
         true
