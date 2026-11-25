@@ -2,7 +2,7 @@
 use super::{
     frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum, VPNRange,
 };
-use crate::config::PAGE_SIZE;
+use crate::config::{BASE_ADDRESS, MEMORY_END, PAGE_SIZE};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -159,35 +159,43 @@ impl PageTable {
             (aligned_pa_usize + offset).into()
         })
     }
-    /// Like [`translate_va`](Self::translate_va), but refuses an empty leaf slot
-    /// instead of reporting physical page zero for it.
-    fn translate_va_valid(&self, va: VirtAddr) -> Option<PhysAddr> {
+    /// Where (and whether) one user byte of this address space lives.
+    ///
+    /// Same gate ch4/ch5 put on every user pointer, and for the same reason: an
+    /// SV39 leaf slot alone tells you nothing about who is allowed to use it.
+    /// A missing/invalid leaf, a supervisor page, a non-readable page, physical
+    /// page zero, or anything outside the RAM window is refused; when the caller
+    /// intends to store, the W bit is required too.
+    pub fn translate_user_byte(&self, va: VirtAddr, writable: bool) -> Option<PhysAddr> {
         let pte = self.find_pte(va.floor())?;
-        if !pte.is_valid() {
+        if !pte.is_valid() || !pte.readable() || !pte.user_accessible() {
             return None;
         }
-        let aligned_pa_usize: usize = PhysAddr::from(pte.ppn()).into();
-        Some((aligned_pa_usize + va.page_offset()).into())
+        if writable && !pte.writable() {
+            return None;
+        }
+        let ppn = pte.ppn();
+        if ppn.0 == 0 {
+            return None;
+        }
+        let pa = usize::from(PhysAddr::from(ppn)) + va.page_offset();
+        if !(BASE_ADDRESS..MEMORY_END).contains(&pa) {
+            return None;
+        }
+        Some(PhysAddr::from(pa))
     }
-    /// Read one byte through this page table.
-    ///
-    /// Returns `None` when the leaf entry is missing or not valid, so a hole in
-    /// the address space never reads back as physical page zero.
+    /// Read one byte of user memory through this page table, `-` on refusal.
     pub fn read_byte(&self, va: VirtAddr) -> Option<u8> {
-        // An invalid leaf has no frame at all (its ppn field reads as 0), which
-        // is why this must not fall through to translate_va.
-        let pa = self.translate_va_valid(va)?;
-        // SAFETY: translate_va_valid only answers for a valid leaf slot of this
-        // page table, so `pa` designates one byte inside a mapped frame; the
-        // caller decides whether reading it is legal (MemorySet::
-        // translate_user_byte adds the U/R/W and RAM-range checks).
+        let pa = self.translate_user_byte(va, false)?;
+        // SAFETY: the gate only answers for a valid, user-readable leaf of this
+        // address space whose physical address is inside the RAM window, which
+        // the kernel identity-maps.
         Some(unsafe { (usize::from(pa) as *const u8).read_volatile() })
     }
-    /// Write one byte through this page table, same validity rule as
-    /// [`read_byte`](Self::read_byte).
+    /// Write one byte of user memory through this page table, `None` on refusal.
     pub fn write_byte(&mut self, va: VirtAddr, value: u8) -> Option<()> {
-        let pa = self.translate_va_valid(va)?;
-        // SAFETY: as above, and the caller checked the W bit.
+        let pa = self.translate_user_byte(va, true)?;
+        // SAFETY: as above, and the gate required the W bit.
         unsafe { (usize::from(pa) as *mut u8).write_volatile(value) };
         Some(())
     }

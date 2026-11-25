@@ -4,7 +4,7 @@ use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use crate::config::{
-    BASE_ADDRESS, MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE,
+    MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE,
     USER_MMAP_LIMIT, USER_STACK_SIZE,
 };
 use crate::sync::UPSafeCell;
@@ -114,25 +114,13 @@ impl MemorySet {
     /// is also what refuses kernel addresses such as `0x8020_0000`: they are
     /// identity mapped in *kernel* space but no user page table maps them U.
     pub fn translate_user_byte(&self, va: usize, writable: bool) -> Option<*mut u8> {
-        let vpn = VirtPageNum((va & !(PAGE_SIZE - 1)) / PAGE_SIZE);
-        let pte = self.page_table.translate(vpn)?;
-        if !pte.is_valid() || !pte.readable() || !pte.user_accessible() {
-            return None;
-        }
-        if writable && !pte.writable() {
-            return None;
-        }
-        let ppn = pte.ppn();
-        if ppn.0 == 0 {
-            return None;
-        }
-        let pa = usize::from(PhysAddr::from(ppn)) + (va % PAGE_SIZE);
-        // The kernel identity-maps all of RAM, so a physical address doubles as
-        // a supervisor-visible one. Anything outside RAM is not ours to touch.
-        if !(BASE_ADDRESS..MEMORY_END).contains(&pa) {
-            return None;
-        }
-        Some(pa as *mut u8)
+        // One gate, defined in `page_table.rs`: the leaf must be valid, user
+        // accessible, readable (and writable when the caller stores), and land
+        // inside the RAM window the kernel identity-maps.
+        let pa = self
+            .page_table
+            .translate_user_byte(VirtAddr::from(va), writable)?;
+        Some(usize::from(pa) as *mut u8)
     }
     /// Read one byte of this address space through the page table.
     pub fn read_user_byte(&self, va: usize) -> Option<u8> {
