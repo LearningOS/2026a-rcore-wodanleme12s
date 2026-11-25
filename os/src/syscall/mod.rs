@@ -37,6 +37,8 @@ const SYSCALL_MMAP: usize = 222;
 const SYSCALL_WAITPID: usize = 260;
 /// spawn syscall
 const SYSCALL_SPAWN: usize = 400;
+/// sleep syscall (used by the blocking `user_lib::sleep_blocking`)
+const SYSCALL_SLEEP: usize = 101;
 
 mod fs;
 mod process;
@@ -60,6 +62,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
         SYSCALL_SBRK => sys_sbrk(args[0] as i32),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
+        SYSCALL_SLEEP => sys_sleep(args[0]),
         _ => panic!("Unsupported syscall_id: {}", syscall_id),
     }
 }

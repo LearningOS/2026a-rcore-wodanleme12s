@@ -9,6 +9,9 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::RefMut;
 
+/// Weight used by tasks that never called `sys_set_priority`.
+pub const DEFAULT_PRIORITY: usize = 5;
+
 /// Task control block structure
 ///
 /// Directly save the contents that will not change during running
@@ -68,6 +71,22 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Stride-scheduling weight: CPU time is shared in proportion to this.
+    /// Always `>= 1`, so the pass increment below cannot divide by zero.
+    pub priority: usize,
+
+    /// Virtual time already charged to this task, in stride units. A task
+    /// becomes runnable again with `pass += WEIGHT / priority`, so a large
+    /// priority charges little virtual time and gets picked more often.
+    pub stride_pass: usize,
+
+    /// Monotonic tie-breaker handed out at (re)enqueue time, so two tasks with
+    /// the same pass run in the order they became ready.
+    pub stride_seq: u64,
+
+    /// Tick at which a `Blocked` task becomes runnable again (`sys_sleep`).
+    pub wake_ticks: usize,
 }
 
 impl TaskControlBlockInner {
@@ -82,8 +101,8 @@ impl TaskControlBlockInner {
     fn get_status(&self) -> TaskStatus {
         self.task_status
     }
-    pub fn is_zombie(&self) -> bool {
-        self.get_status() == TaskStatus::Zombie
+    pub fn is_exited(&self) -> bool {
+        self.get_status() == TaskStatus::Exited
     }
 }
 
@@ -118,6 +137,10 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    priority: DEFAULT_PRIORITY,
+                    stride_pass: 0,
+                    stride_seq: 0,
+                    wake_ticks: 0,
                 })
             },
         };
@@ -191,6 +214,10 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    priority: parent_inner.priority,
+                    stride_pass: parent_inner.stride_pass,
+                    stride_seq: 0,
+                    wake_ticks: 0,
                 })
             },
         });
@@ -204,6 +231,20 @@ impl TaskControlBlock {
         task_control_block
         // **** release child PCB
         // ---- release parent PCB
+    }
+
+    /// Re-weight this task for the stride scheduler.
+    ///
+    /// Only this task's own pass is re-based (to the smallest pass currently in
+    /// the ready queue), which is what keeps a priority change from jumping the
+    /// line *or* starving everybody else. Raising the global epoch instead — as
+    /// a "recompute everyone" shortcut would do — hands the changed task an
+    /// arbitrarily large head start and, with isize-sized arithmetic, can even
+    /// wrap around into negative passes.
+    pub fn set_priority(&self, priority: usize) {
+        let mut inner = self.inner_exclusive_access();
+        inner.priority = priority.max(1);
+        inner.stride_pass = crate::task::min_runnable_pass();
     }
 
     /// get pid of process
@@ -247,6 +288,8 @@ pub enum TaskStatus {
     Ready,
     /// running
     Running,
-    /// exited
-    Zombie,
+    /// finished, waiting to be reaped by its parent
+    Exited,
+    /// parked until a timer deadline (`sys_sleep`) or an event wakes it
+    Blocked,
 }
