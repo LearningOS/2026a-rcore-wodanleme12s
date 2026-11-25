@@ -1,6 +1,6 @@
 # Lab 2 · 检测器的形态：不维护 wait-for 图，改成「按需重建 + 归约」
 
-对应改动：`os/src/sync/deadlock.rs`（本分支的主战场，500 行）、
+对应改动：`os/src/sync/deadlock.rs`（本分支的主战场，528 行）、
 `os/src/sync/semaphore.rs`、`os/src/sync/mutex.rs`、`os/src/task/mod.rs`。
 判分证据：`logs/c3_ch8_final.log`（25/25）。
 
@@ -86,19 +86,48 @@ sem1 的 `main` 握着 barrier 信号量的 3 个单位并 `sleep(500)`，它没
 所以 `test_condvar` / `mpsc_sem` / `sync_sem` 三个用例完全不受本模块影响；
 自旋互斥量不 park 任何人，既不是节点也不是边，`race_adder_mutex_spin` 同理。
 
-## 6. 仍未收口的一处
+## 6. 开关的作用域：从全局 `static mut` 收到按地址空间
 
-`ENABLED` 是**全局** `static mut bool`（`deadlock.rs:99`），不是按地址空间存的。
-`enable_deadlock_detect()` 只有三个 deadlock 用例调用，且全部传 `true`、没有一处传 `false`：
-`ch8_usertest` 的 `TESTS` 数组里 mutex1/sem1/sem2 是第 14~16 项（对应 pid 14/15/16），
-它们之后的 `mpsc_sem`、`phil_din_mutex`、`sync_sem`、`test_condvar`、`threads`、`threads_arg`
-（pid 17~23）都是**在检测已开启的状态下**运行的——因为 23 个用例是先 `fork` 完再按 pid 顺序 `waitpid`，
-时间上完全重叠。
+第一版把开关做成了全局 `static mut ENABLED: bool`。这在 ch8 的用例结构下是有越界的：
+`enable_deadlock_detect()` 只有三个 deadlock 用例调用且全部传 `true`（没有任何一处传 `false`），
+而 `ch8_usertest` 的 23 个用例是**先全部 fork、再按 pid 顺序 `waitpid`**，时间上完全重叠——
+mutex1/sem1/sem2 是第 14~16 项（pid 14/15/16），它们之后的 `mpsc_sem`、`phil_din_mutex`、
+`race_adder_mutex_spin`、`sync_sem`、`test_condvar`、`threads`、`threads_arg`（pid 17~23）
+都是在检测开启的状态下跑的。
 
-本轮 25/25 的含义因此要说准：它证明的是「归约对这批用例恒不给出拒绝」，
-而不是「开关对它们是关闭的」。前者是实测，后者从来不成立。
-把它改成 `per-process` 开关是结构上的正解，我没有在交付版里顺手做，理由不是省事，而是那次改动会和
-`sys_get_time` 的修复落进同一个 diff：两条因果链一旦交叉，下一轮的 PASS 数就无法再归因到某一个原因，
-而这一轮的排查已经为「读数无法归因」付过两次代价（见 lab1 的 probe8 与 lab4 的三个假说）。
-留作下一步独立变更。
+现在的开关按地址空间存（`os/src/sync/deadlock.rs:99-141`）：
+
+```rust
+lazy_static! {
+    static ref ARMED: UPSafeCell<Vec<usize>> = unsafe { UPSafeCell::new(Vec::new()) };
+}
+
+fn enabled() -> bool {
+    match current_pid() {
+        Some(pid) => ARMED.exclusive_access().contains(&pid),
+        None => false,
+    }
+}
+
+/// The calling process' id, read *without* borrowing its inner state: `enabled()` runs
+/// inside the primitives, where a `RefMut` on the address space may already be live.
+fn current_pid() -> Option<usize> {
+    Some(current_task()?.process.upgrade()?.getpid())
+}
+```
+
+三个细节不是风格问题：
+
+1. `current_pid()` 不走 `current_process()?.inner_exclusive_access()`。`enabled()` 会在
+   `grant_me`/`park_me`/`release_me` 这些点上被调用，而那些调用点的邻居就是各种 `RefMut`；
+   再借一次 PCB 内部就是把自己暴露在 double-borrow panic 下。`getpid()` 读的是 PCB 上的
+   普通字段，不需要借位。
+2. 记录的是 pid 而不是布尔位。本内核的 pid 单调分配、一次会话内不复用，所以进程退出后
+   残留一项不会被再次问到，不需要在 `exit` 路径上挂清理钩子——这正是上一版被迫加
+   `forget_task()` 的那类「为了维护副本而维护副本」的代码，这里结构性地不需要。
+3. `set_enabled(false)` 仍然支持（把本 pid 从表里摘掉），语义和官方 syscall 的入参一致。
+
+效果与代价：判决结果不变（`logs/c3_ch8_pidscope2.log`，`Test passed35863: 25/25`、`MAKE_RC=0`），
+但越界消失——没有调用过 `enable_deadlock_detect` 的地址空间不再被询问，
+`mpsc_sem`/`sync_sem` 那两类误拒随之不存在（逐案读数见 lab5 §3）。
 

@@ -74,15 +74,20 @@
 //! Failing it is exactly as good as failing `t3` later, and it is checkable without
 //! leaving state behind.
 //!
-//! Condvars contribute nothing to the reduction: they park a task until somebody
-//! signals, not until a resource is granted, so `test_condvar`, `mpsc_sem` and
-//! `sync_sem` are untouched. Spin mutexes busy-wait without parking anybody, so they
-//! are neither nodes nor edges and `race_adder_mutex_spin` never appears here.
+//! Two separate reasons keep the rest of ch8 off this code path, and they are worth
+//! telling apart. Structurally: arming is per address space (the `ARMED` list below),
+//! so a process that never calls `sys_enable_deadlock_detect` is not consulted at all —
+//! that covers `test_condvar`, `mpsc_sem`, `sync_sem` and the `race_adder_*` family
+//! regardless of what they wait on. Substantively, for the address spaces that *are*
+//! armed: condvars contribute nothing to the reduction (they park a task until somebody
+//! signals, not until a resource is granted), and spin mutexes busy-wait without parking
+//! anybody, so they are neither nodes nor edges.
 
-use super::{Mutex, Semaphore};
+use super::{Mutex, Semaphore, UPSafeCell};
 use crate::task::{current_task, pid2process, TaskControlBlock};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use lazy_static::lazy_static;
 
 /// Error code the ch8 tests expect from an acquire that would deadlock.
 pub const DEADLOCK: isize = -0xdead;
@@ -95,22 +100,48 @@ pub type ResKey = (usize, usize);
 /// A task node: `(pid, tid)`.
 pub type TaskKey = (usize, usize);
 
-/// Is detection armed? Everything here is a no-op while it is not, so the other ch8
-/// tests keep their original behaviour bit for bit.
-static mut ENABLED: bool = false;
-
-/// Arm or disarm. Nothing is cached, so disarming cannot leave stale edges behind.
-pub fn set_enabled(yes: bool) {
-    // SAFETY: single hart, and the kernel cannot trap back into itself while a
-    // syscall runs — the same rule that makes `UPSafeCell` sound in `sync/up.rs`.
-    unsafe { ENABLED = yes }
+// The address spaces that have armed detection.
+//
+// Per-process rather than one global flag, because `ch8_usertest` forks all 23 cases
+// up front and the three deadlock tests never disarm: with a global flag every later
+// case (`mpsc_sem`, `sync_sem`, ...) would be held to refusals it never opted into,
+// and the reduction does refuse a `down` on a zero-count semaphore whose producer has
+// not run yet — legitimate blocking, not a deadlock.
+//
+// Process ids are allocated monotonically and are not reused inside a session, so an
+// entry needs no cleanup when its process exits: that pid is never asked about again,
+// and the list stays a few entries long.
+lazy_static! {
+    static ref ARMED: UPSafeCell<Vec<usize>> = unsafe { UPSafeCell::new(Vec::new()) };
 }
 
-/// Detection armed?
-#[allow(dead_code)]
-pub fn enabled() -> bool {
-    // SAFETY: as above.
-    unsafe { ENABLED }
+/// Arm or disarm detection for the calling address space. Nothing about the objects is
+/// cached, so disarming cannot leave stale state behind.
+pub fn set_enabled(yes: bool) {
+    let Some(pid) = current_pid() else { return };
+    let mut armed = ARMED.exclusive_access();
+    if yes {
+        if !armed.contains(&pid) {
+            armed.push(pid);
+        }
+    } else if let Some(pos) = armed.iter().position(|p| *p == pid) {
+        armed.remove(pos);
+    }
+}
+
+/// Is detection armed for the calling address space? Everything below is a no-op while
+/// it is not, so the other ch8 tests keep their original behaviour bit for bit.
+fn enabled() -> bool {
+    match current_pid() {
+        Some(pid) => ARMED.exclusive_access().contains(&pid),
+        None => false,
+    }
+}
+
+/// The calling process' id, read *without* borrowing its inner state: `enabled()` runs
+/// inside the primitives, where a `RefMut` on the address space may already be live.
+fn current_pid() -> Option<usize> {
+    Some(current_task()?.process.upgrade()?.getpid())
 }
 
 /// The derived state of one address space, in exactly the shape [`served`] reads.

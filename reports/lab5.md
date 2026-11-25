@@ -2,40 +2,42 @@
 
 ## 1. 交付读数
 
-交付读数是 `logs/c3_ch8_verify.log`（未放宽超时、内核内无任何探针、`reports/` 齐备）：
+交付读数是 `logs/c3_ch8_verify2.log`（推送的内容与之一致，未放宽超时、内核内无任何探针、
+`reports/` 齐备）：
 
 ```
-Test passed46471: 25/25
+Test passed10986: 25/25
 Report for lab1 found.   ... Report for lab5 found.
 MAKE_RC=0
 [PASS] not found <FAIL: T.T>
 [PASS] not found <Test sbrk failed!>
 ```
 
-它的前一次 `logs/c3_ch8_final.log`（后缀 `50353`）同样给出 `25/25`，唯一区别是当时
-`reports/` 还没有内容，`MAKE_RC=2` 来自判决之后的报告闸。两轮判决完全一致，
-所以报告缺失没有影响用例本身。
+它前面三轮的关系值得列清楚，因为「同一个 25/25」在它们之间含义并不相同：
 
-`~/.local/bin/python3.12 rig3_c_gaps.py ch8 logs/c3_ch8_final.log` 的差集：
+| 日志 | 后缀 | 读数 | 内核状态 |
+|---|---|---|---|
+| `c3_ch8_final.log` | 50353 | 25/25，`MAKE_RC=2` | 探针已撤净；`MAKE_RC=2` 只来自报告闸（lab1 §2 第 B 类） |
+| `c3_ch8_verify.log` | 46471 | 25/25，`MAKE_RC=0` | 同上 + 五份报告齐备；开关仍是全局版 |
+| `c3_ch8_pidscope2.log` | 35863 | 25/25，`MAKE_RC=0` | 开关改为按地址空间（本节末与 lab2 §6） |
+| `c3_ch8_verify2.log` | 10986 | 25/25，`MAKE_RC=0` | 与推送内容逐字节一致，含模块头的措辞修订 |
 
-```
-verdict_lines=[('25', '25')]  逐条判决行数=25
-需补齐=0
-不该出现却出现了=0
-```
+中间还有一次失败：`c3_ch8_pidscope.log` 编译不过（`unused doc comment` + `E0308`），
+读数 `2/25` 是遗留镜像的假读数（lab1 §2 第 A 类）。这条记在这里是为了留下判据本身——
+如果只看到 `2/25` 就去查检测器，又会走一遍 lab4 的弯路。
 
-`grep -ac "error: could not compile"` 在两轮都是 0。`CHAPTER=8` 需要 `lab1..lab5` 五个文件齐备，
-闸口才闭合，这一点由 `verify` 轮的 `MAKE_RC=0` 直接证实。
-
-同一分支此前两次的提交记录：
+同一分支本回合之前的提交记录：
 
 ```
 20d6885  ch8: 死锁检测改为「按需重建二部 wait-for 图」，并记下仍未解决的墙钟问题
 eab2c61  wip(ch8): queue-depth aware deadlock detection, unverified checkpoint
+c9da2e0  ch8: 25/25 达成——死锁检测改为按需归约，并补上 sys_get_time
 ```
 
-`eab2c61` 的提交信息里我自己标了 unverified；本轮把它变成 verified 的内容是两处：
-归约规则的最终形态（lab2）和 `sys_get_time`（lab4）。
+`eab2c61` 的提交信息里我自己标了 unverified；把它变成 verified 的内容是两处：
+归约规则的最终形态（lab2）和 `sys_get_time`（lab4），两者都在 `c9da2e0`。
+本节末的开关作用域收口另起一个提交，不与之混在一起，理由就是 lab4 §5 那条归因原则：
+一次改动只对应一条能独立复现的因果链，否则下一次读数无法归因。
 
 ## 2. 探针撤净的清单与验证方式
 
@@ -64,7 +66,7 @@ $ grep -rn "probe\|TEMPORARY\|\[dl\]\|\[sd\]\|\[su\]\|\[sl\]\|\[tw\]\|\[sq\]\|\[
 `syscall/process.rs`、`task/mod.rs`。撤完必须重跑官方轮——诊断态的 25/25 与官方态的 25/25
 是两次独立读数（lab1 §3），这一步不能省。
 
-## 3. 没被 25/25 覆盖的问题之一：检测开关是全局的，而 `mpsc_sem` 的记账会漂
+## 3. 没被 25/25 覆盖的问题之一：开关作用域（已收口）与 `mpsc_sem` 的记账漂移（未收口）
 
 `ENABLED`（`os/src/sync/deadlock.rs:99`）是 `static mut bool`。三个 deadlock 用例把它打开后再没有人关掉，
 而 `ch8_usertest` 的 23 个用例并发运行，所以后面的用例是在检测开启的状态下跑的。这在 `probe10` 的日志里
@@ -108,7 +110,14 @@ pid 55 是 `ch8b_mpsc_sem`。它的形状暴露了归约的适用边界：
 
 本轮这些拒绝都没有扣分，因为 `mpsc_sem` 和 `sync_sem` 都不接收 `semaphore_down` 的返回值，
 `assert` 只查创建时的 id 顺序，测试照样打出 `mpsc_sem passed50353!` / `sync_sem passed50353!`。
-但这是**通过得比设计更宽松**，不是无害。收口方向两步，都不该和这次的修复混在一个 diff 里：
+但这是**通过得比设计更宽松**，不是无害。
+
+**（本节的开关部分已在下一个提交收口：`ENABLED: static mut bool` 换成按地址空间记账的
+`ARMED: UPSafeCell<Vec<usize>>`，未调用 `enable_deadlock_detect` 的进程不再被询问；
+判决不变，`logs/c3_ch8_pidscope2.log` = `Test passed35863: 25/25`、`MAKE_RC=0`，
+实现细节与两条设计取舍见 lab2 §6。下面的记账漂移是另一半，未收口。）**
+
+收口方向两步，都不该和这次的修复混在一个 diff 里：
 
 1. 开关改为按地址空间存（`build_graph(me.0)` 本来就是按进程重建的，把 `enabled()` 也变成按进程读即可），
    未调用 `enable_deadlock_detect` 的进程永远走原路径——上面两类误拒随之消失，
