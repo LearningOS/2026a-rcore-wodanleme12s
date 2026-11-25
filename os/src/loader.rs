@@ -4,8 +4,16 @@
 //! kernel binary, so we only need to copy them to the space allocated for each
 //! app to load them. We also allocate fixed spaces for each task's
 //! [`KernelStack`] and [`UserStack`].
+//!
+//! Because there is no paging here, these static regions *are* the set of
+//! addresses a task may legitimately hand to the kernel. Each one is therefore
+//! registered with the user pointer gate (`crate::mm::user_ptr`) as it is set
+//! up, which is what lets syscalls validate user addresses without hardcoding
+//! this layout. When ch4 introduces per-task page tables, that registration
+//! moves into the address-space setup and the gate switches backends.
 
 use crate::config::*;
+use crate::mm::{register_app_slot, register_user_stack};
 use crate::trap::TrapContext;
 use core::arch::asm;
 
@@ -45,6 +53,10 @@ impl KernelStack {
 impl UserStack {
     fn get_sp(&self) -> usize {
         self.data.as_ptr() as usize + USER_STACK_SIZE
+    }
+    /// `[base, top)` of this task's user stack.
+    fn region(&self) -> (usize, usize) {
+        (self.data.as_ptr() as usize, self.get_sp())
     }
 }
 
@@ -92,12 +104,18 @@ pub fn load_apps() {
     unsafe {
         asm!("fence.i");
     }
+    // The app slots are laid out contiguously from APP_BASE_ADDRESS, so one
+    // window covers every task's image. Registering it here (rather than in
+    // each syscall) keeps the layout knowledge in this module.
+    register_app_slot(APP_BASE_ADDRESS, num_app * APP_SIZE_LIMIT);
 }
 
 /// get app info with entry and sp and save `TrapContext` in kernel stack
 pub fn init_app_cx(app_id: usize) -> usize {
+    let (stack_base, stack_top) = USER_STACK[app_id].region();
+    register_user_stack(app_id, stack_base, stack_top - stack_base);
     KERNEL_STACK[app_id].push_context(TrapContext::app_init_context(
         get_base_i(app_id),
-        USER_STACK[app_id].get_sp(),
+        stack_top,
     ))
 }

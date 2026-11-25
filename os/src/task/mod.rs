@@ -9,6 +9,7 @@
 //! Be careful when you see `__switch` ASM function in `switch.S`. Control flow around this function
 //! might not be what you expect.
 
+mod accounting;
 mod context;
 mod switch;
 #[allow(clippy::module_inception)]
@@ -51,10 +52,15 @@ lazy_static! {
     /// Global variable: TASK_MANAGER
     pub static ref TASK_MANAGER: TaskManager = {
         let num_app = get_num_app();
-        let mut tasks = [TaskControlBlock {
-            task_cx: TaskContext::zero_init(),
-            task_status: TaskStatus::UnInit,
-        }; MAX_APP_NUM];
+        // The TCB now owns a syscall counter, which is too big to `Copy` out
+        // of an array repeat expression, so build the table element by element.
+        let mut tasks: [TaskControlBlock; MAX_APP_NUM] = core::array::from_fn(|_| {
+            TaskControlBlock {
+                task_cx: TaskContext::zero_init(),
+                task_status: TaskStatus::UnInit,
+                syscall_counter: accounting::SyscallCounter::zero_init(),
+            }
+        });
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
             task.task_status = TaskStatus::Ready;
@@ -72,6 +78,28 @@ lazy_static! {
 }
 
 impl TaskManager {
+    /// Record one invocation of syscall `id` by the current task.
+    ///
+    /// Called from the trap entry *before* dispatching, so a query about the
+    /// tracing syscall itself already includes the query being answered — that
+    /// is what `ch3_trace`'s `assert_eq!(2, count_syscall(SYSCALL_TRACE))`
+    /// relies on.
+    fn record_syscall(&self, id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_counter.record(id);
+    }
+
+    /// How many times the current task invoked syscall `id`, including any
+    /// counting that happens before this very call is dispatched.
+    ///
+    /// Returns `None` when the id is not tracked or there is no current task.
+    fn syscall_count(&self, id: usize) -> Option<usize> {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_counter.count(id)
+    }
+
     /// Run the first task in task list.
     ///
     /// Generally, the first task in task list is an idle task (we call it zero process later).
@@ -156,6 +184,17 @@ fn mark_current_suspended() {
 /// Change the status of current `Running` task into `Exited`.
 fn mark_current_exited() {
     TASK_MANAGER.mark_current_exited();
+}
+
+/// Record one invocation of syscall `id` against the current task.
+pub fn record_syscall(id: usize) {
+    TASK_MANAGER.record_syscall(id);
+}
+
+/// Syscall invocation count of the current task for `id`, or `None` if the id
+/// is not tracked.
+pub fn current_syscall_count(id: usize) -> Option<usize> {
+    TASK_MANAGER.syscall_count(id)
 }
 
 /// Suspend the current 'Running' task and run the next task in task list.

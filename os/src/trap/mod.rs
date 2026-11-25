@@ -15,7 +15,7 @@
 mod context;
 
 use crate::syscall::syscall;
-use crate::task::{exit_current_and_run_next, suspend_current_and_run_next};
+use crate::task::{exit_current_and_run_next, record_syscall, suspend_current_and_run_next};
 use crate::timer::set_next_trigger;
 use core::arch::global_asm;
 use riscv::register::{
@@ -53,6 +53,12 @@ pub fn trap_handler(cx: &mut TrapContext) -> &mut TrapContext {
         Trap::Exception(Exception::UserEnvCall) => {
             // jump to next instruction anyway
             cx.sepc += 4;
+            // Account for this invocation *before* dispatching it. `sys_trace`
+            // answers "how many times have I called syscall id?", and the test
+            // asserts that a query about the tracing syscall itself already
+            // counts the query, so the record has to happen here rather than
+            // inside the implementation.
+            record_syscall(cx.x[17]);
             // get system call return value
             cx.x[10] = syscall(cx.x[17], [cx.x[10], cx.x[11], cx.x[12]]) as usize;
         }
