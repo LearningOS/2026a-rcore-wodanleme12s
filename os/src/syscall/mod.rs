@@ -71,7 +71,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 4]) -> isize {
         SYSCALL_DUP => sys_dup(args[0]),
         SYSCALL_LINKAT => sys_linkat(args[1] as *const u8, args[3] as *const u8),
         SYSCALL_UNLINKAT => sys_unlinkat(args[1] as *const u8),
-        SYSCALL_PIPE => sys_pipe(args[1] as *mut [usize; 2]),
+        // `pipe(pipe_fd)` is the odd one out: user_lib wraps it as
+        // `syscall(SYSCALL_PIPE, [pipe.as_mut_ptr(), 0, 0])`, so the array lives in a0 —
+        // unlike openat/linkat/unlinkat, whose a0 holds the `AT_FDCWD` dirfd that this
+        // flat-namespace kernel ignores and therefore reads its real argument from a1/a3.
+        SYSCALL_PIPE => sys_pipe(args[0] as *mut [usize; 2]),
         SYSCALL_READ => sys_read(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut Stat),
