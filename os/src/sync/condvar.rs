@@ -38,11 +38,14 @@ impl Condvar {
     /// blocking current task, let it wait on the condition variable
     pub fn wait(&self, mutex: Arc<dyn Mutex>) {
         trace!("kernel: Condvar::wait_with_mutex");
-        mutex.unlock();
+        // A condvar parks its waiter until somebody signals it, not until a
+        // resource is granted, so it contributes no wait-for edge and the
+        // detector never sees it (see sync/deadlock.rs).
+        let _ = mutex.unlock();
         let mut inner = self.inner.exclusive_access();
         inner.wait_queue.push_back(current_task().unwrap());
         drop(inner);
         block_current_and_run_next();
-        mutex.lock();
+        let _ = mutex.lock();
     }
 }

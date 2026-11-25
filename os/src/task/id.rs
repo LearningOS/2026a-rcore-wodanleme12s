@@ -134,6 +134,15 @@ pub struct TaskUserRes {
     pub ustack_base: usize,
     /// process belongs to
     pub process: Weak<ProcessControlBlock>,
+    /// The resource this task is parked on, as a `deadlock::ResKey`, or `None`
+    /// while runnable. This *is* the task's wait-for edge: a plain integer, so it
+    /// needs no lifetime argument and keeps no object alive.
+    pub blocked_in: Option<crate::sync::ResKey>,
+    /// Grants this task has taken and not given back yet: `(resource, units)`, at
+    /// most one entry per resource, so two units of one semaphore is one record.
+    /// The detector rebuilds "who holds this object" from these numbers instead of
+    /// storing a holder list in the object itself — see `sync/deadlock.rs`.
+    pub grants: Vec<(crate::sync::ResKey, usize)>,
 }
 /// Return the bottom addr (low addr) of the trap context for a task
 fn trap_cx_bottom_from_tid(tid: usize) -> usize {
@@ -156,6 +165,8 @@ impl TaskUserRes {
             tid,
             ustack_base,
             process: Arc::downgrade(&process),
+            blocked_in: None,
+            grants: Vec::new(),
         };
         if alloc_user_res {
             task_user_res.alloc_user_res();

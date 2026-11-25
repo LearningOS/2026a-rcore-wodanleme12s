@@ -19,18 +19,17 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
-use self::id::TaskUserRes;
 use crate::fs::{open_file, OpenFlags};
 use crate::task::manager::add_stopping_task;
 use crate::timer::remove_timer;
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
 use manager::fetch_task;
-use process::ProcessControlBlock;
+pub use process::ProcessControlBlock;
 use switch::__switch;
 
 pub use context::TaskContext;
-pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
+pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, TaskUserRes, IDLE_PID};
 pub use manager::{add_task, pid2process, remove_from_pid2process, remove_task, wakeup_task};
 pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
@@ -78,6 +77,10 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     );
     // take from Processor
     let task = take_current_task().unwrap();
+    // A task that dies parked on a mutex/semaphore must leave no wait-for edge
+    // behind, otherwise the detector would keep believing it is in somebody's
+    // queue. No-op while detection is disarmed.
+    crate::sync::deadlock::forget_task(&task);
     let mut task_inner = task.inner_exclusive_access();
     let process = task.process.upgrade().unwrap();
     let tid = task_inner.res.as_ref().unwrap().tid;
